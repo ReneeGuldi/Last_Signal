@@ -15,11 +15,16 @@
     </style>
 </head>
 <body> 
-    <div id="hud">   Health: 100</div>
+    <div id="hud">
+        <div id="health">Health: 100</div>
+        <div id="ammo">Ammo: 30</div>
+        <div id="parts">Radio parts: 0 / 3</div>
+    </div>
+    <div id="message"></div>
     <div id="crosshair"></div>
     <div id="overlay">
-        <h1>LAST SIGNAL</h1>
-        <p> Click to Start </p>
+        <h1 id="overlay-title">LAST SIGNAL</h1>
+        <p id="overlay=text">Loading...</p>
         <p>Move: WASD, Sprint: Shift, Jump: Space, Look Around: Mouse</p>
     </div>
 
