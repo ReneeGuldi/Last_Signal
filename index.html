@@ -7,11 +7,14 @@
         body { margin: 0; overflow: hidden; background: #000; font-family: monospace;}
         #hud { position: absolute; top: 16px; left: 16px; color: #e8c39e; 
                     font-size: 18px; text-shadow: 1px 1px 2px #000;}
-        #crosshair { position: 18px; top: 50%; left: 50; width: 6px; height: 6px;
+        #crosshair { position: 18px; top: 50%; left: 50%; width: 6px; height: 6px;
                     margin: -3px 0 0 -3px; background: #fff; border-radius: 50%;}
         #overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
                 align-items: center; justify-content: center; text-align: center;
                 background: rgba(0,0,0,0.75); color: #e8c39e; cursor: pointer; }
+        #message { position: absolute; top: 30%; width: 100%; text-align: center;
+                color: #ffd84a; font-size: 22px; text-shadow: 1px 1px 3px #000;
+                pointer-events: none; }
     </style>
 </head>
 <body> 
@@ -24,7 +27,7 @@
     <div id="crosshair"></div>
     <div id="overlay">
         <h1 id="overlay-title">LAST SIGNAL</h1>
-        <p id="overlay=text">Loading...</p>
+        <p id="overlay-text">Loading...</p>
         <p>Move: WASD, Sprint: Shift, Jump: Space, Look Around: Mouse</p>
     </div>
 
@@ -33,7 +36,7 @@
     {
         "imports": {
             "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
             "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
         }
     }

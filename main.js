@@ -1,19 +1,19 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
-import { GLTFLoader } from 'three/addons/controls/PointerLockControls';
+import { GLTFLoader } from 'three/addons/controls/GLTFLoader.js';
 import * as CANNON from 'cannon-es';
 
 // Creating the Renderer, Scene, and Game Camera
 const renderer = new THREE.WebGLRenderer({ antialias: true});
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRtion(Math.min(window.devicePixelRation, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 // dusty orange sky, may alter
 const SKY_COLOR = 0xb08560;
-scene.background = new.THREE.Color(SKY_COLOR);
+scene.background = new THREE.Color(SKY_COLOR);
 // (color, start, end) - focused on hiding map edges
 scene.fog = new THREE.Fog(SKY_COLOR, 10, 90); 
 
@@ -37,13 +37,13 @@ scene.add(sun);
 // Game Physics through cannon-es
 // Physics will run in its own invisible world, where each frame we copy the
 // physics body positions onto the visible Three.js meshes.
-const world = new CANNON.World({ gravit: new CANNON.Vec3(0, -20, 0)});
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -20, 0)});
 // stop the player from sticking to walls
 world.defaultContactMaterial.friction = 0;
 
 //------------------------------------------------
 // Ground
-const groundMesh = new THREE.mesh(
+const groundMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(400, 400),
     new THREE.MeshStandardMaterial({ color: 0x8a6a4a })
 );
@@ -79,7 +79,7 @@ const loader = new GLTFLoader();
 async function loadModels() {
     const names = Object.keys(MODEL_FILES);
     const loaded = await Promise.all(names.map((n) => loader.loadAsync(MODEL_FILES[n])));
-    names.forEach((name, i)) => {
+    names.forEach((name, i) => {
         const model = loaded[i].scene;
         model.traverse((child) => {
             if (child.isMesh) {
@@ -88,7 +88,7 @@ async function loadModels() {
             }
         });
         models[name] = model;
-    }
+    });
 }
 
 
@@ -96,7 +96,7 @@ async function loadModels() {
 // yOffset is used to shift the model inside a "holder" group
 // Physics bodies are centered in the middle, but models' origins are at the feet
 // shifting them down by half their height to line up correctly.
-function spawnModel(name, scale = 1, yoffset = 0) {
+function spawnModel(name, scale = 1, yOffset = 0) {
     const inner = models[name].clone();
     // Give each copy its own materials so singular items can flash without
     // changing all models of that type
@@ -119,7 +119,7 @@ function spawnModel(name, scale = 1, yoffset = 0) {
 // Used for placeholder buildings, cars, crates, etc
 function createBox(w, h, d, x, z, color, mass = 0) {
     const mesh = new THREE.Mesh(
-        new THREE.BoxGeometry(w, h, d)
+        new THREE.BoxGeometry(w, h, d),
         new THREE.MeshStandardMaterial({ color })
     );
     mesh.castShadow = true;
@@ -136,40 +136,6 @@ function createBox(w, h, d, x, z, color, mass = 0) {
 
     mesh.position.copy(body.position);
     return { mesh, body };
-}
-
-
-// Placeholder locations, to be swapped for real models once created
-
-// GAS STATION
-createBox(12, 6, 10, 30, -20, 0x6b5b4b);
-
-// COLLAPSED HOUSE
-createBox(8, 5, 8, -35, 15, 0x5a4a3a);
-
-// CRASHED BUS
-createBox(3, 2.5, 10, 10, 30, 0x4a5a5a);
-
-// RADIO TOWER
-createBox(3, 25, 3, 0, -50, 0x33333);
-
-
-// Dynamic crates (mass > 0), can be moved around with physics
-const crates = [];
-
-for (let i = 0; i < 6; i++) {
-    crates.push(createBox(1, 1, 1, -5 + i * 1.5, -8, 0xa0784a, 5));
-}
-
-// Random rocks for scenery (visual only, not moved by physics)
-for (let i = 0; i < 80; i++) {
-    const rock = new THREE.Mesh(
-        new THREE.DodecahedronGeometry(Math.random() * 1.2 + 0.3),
-        new THREE.MeshStandardMaterial({ color: 0x6e5a48, flatShading: true})
-    );
-    rock.position.set((Math.random() - 0.5) * 300, 0.2, (Math.random() - 0.5) * 300);
-    rock.castShadow = true;
-    scene.add(rock);
 }
 
 
@@ -191,7 +157,7 @@ function spawnBarrel(x, z) {
     const mesh = spawnModel('barrel', 1, -0.5);
     const body = new CANNON.Body({
         mass: 10,
-        shape: new CANNON.Cylinder(new CANNON.Vec3(0.35, 0.35, 1, 8)),
+        shape: new CANNON.Cylinder(0.35, 0.35, 1, 8),
         position: new CANNON.Vec3(x, 0.5, z),
     });
     world.addBody(body);
@@ -224,15 +190,26 @@ let ready = false; // true once models finish loading
 // PointerLockControls hides the curser and turns mouse movement into looking around
 const controls = new PointerLockControls(camera, document.body);
 const overlay = document.getElementById('overlay');
-const hud = document.getElementById('hud');
+const overlayTitle = document.getElementById('overlay-title');
+const overlayText = document.getElementById('overlay-text');
+const messageEl = document.getElementById('message');
+const healthEl = document.getElementById('health');
+const ammoEl = document.getElementById('ammo');
+const partsEl = document.getElementById('parts');
 
-overlay.addEventListener('click', () => { if (!gameOver) controls.lock(); });
+overlay.addEventListener('click', () => { if (ready && !gameOver) controls.lock(); });
 controls.addEventListener('lock', () => (overlay.style.display = 'none'));
 controls.addEventListener('unlock', () => (overlay.style.display = 'flex'));
 
 const keys = {};
 document.addEventListener('keydown', (e) => (keys[e.code] = true));
 document.addEventListener('keyup', (e) => (keys[e.code] = false));
+
+function updateHUD() {
+    healthEl.textContent = `Health: ${Math.max(0, Math.ceil(health))}`;
+    ammoEl.textContent = `Ammo: ${ammo}`;
+    partsEl.textContent = `Parts: ${partsFound}/3`;
+}
 
 let messageTimer = null;
 function showMessage(text, seconds = 2.5) {
@@ -267,7 +244,7 @@ function updatePlayer() {
 
     // Simple jump: can't do if moving vertically already
     if (keys.Space && Math.abs(playerBody.velocity.y) < 0.1) {
-        playerBody.velocity.y = 0;
+        playerBody.velocity.y = 8;
     }
 
     // Camera follows the physics body
@@ -352,7 +329,7 @@ function spawnPickup(type, x, z) {
         mesh.add(glow);
     }
 
-    picksups.push({ type, mesh, collected: false });
+    pickups.push({ type, mesh, collected: false });
 }
 
 function collect(p) {
@@ -365,7 +342,7 @@ function collect(p) {
         if (partsFound === 3) {
             showMessage('All parts found! Get to the radio tower.', 5);
         } else {
-            showMessage('Found ${config.name}! (${partsFound}/3)');
+            showMessage(`Found ${config.name}! (${partsFound}/3)`);
         }
     } else if (p.type === 'medkit') {
         health = Math.min(100, health + 35);
@@ -381,7 +358,7 @@ function updatePickups(dt, time) {
     for (const p of pickups) {
         if (p.collected) continue;
 
-        p.mesh.position.y += dt * 1.5;
+        p.mesh.rotation.y += dt * 1.5;
         p.mesh.position.y = 0.6 + Math.sin(time * 2) * 0.15;
 
         const dist = Math.hypot(
@@ -450,8 +427,8 @@ function animate() {
 
     if (!gameOver) {
         updatePlayer();
-        updateHusks();
-        updatePickups();
+        updateHusks(dt, time);
+        updatePickups(dt, time);
         world.step(1 / 60, dt, 3);
     }
 
@@ -471,6 +448,12 @@ function animate() {
 
     renderer.render(scene, camera);
 }
+
+window.addEventListener('resize', () => { 
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
 
 
 //------------------------------------------------
