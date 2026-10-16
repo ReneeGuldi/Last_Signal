@@ -117,6 +117,7 @@ function spawnModel(name, scale = 1, yOffset = 0) {
 //------------------------------------------------
 // Helper Functions
 // Used for placeholder buildings, cars, crates, etc
+const obstacles = [];
 function createBox(w, h, d, x, z, color, mass = 0) {
     const mesh = new THREE.Mesh(
         new THREE.BoxGeometry(w, h, d),
@@ -125,6 +126,7 @@ function createBox(w, h, d, x, z, color, mass = 0) {
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
+    obstacles.push(mesh);
 
     // Cannon boxes are half size
     const body = new CANNON.Body({
@@ -149,8 +151,12 @@ function spawnCrate(x, z) {
         shape: new CANNON.Box(new CANNON.Vec3(0.5, 0.5, 0.5)),
         position: new CANNON.Vec3(x, 0.5, z),
     });
+    body.linearDamping = 0.4;
+    body.angularDamping = 0.6;
     world.addBody(body);
-    props.push({ mesh, body });
+    const prop = { mesh, body };
+    mesh.userData.prop = prop;
+    props.push(prop);
 }
 
 function spawnBarrel(x, z) {
@@ -161,7 +167,9 @@ function spawnBarrel(x, z) {
         position: new CANNON.Vec3(x, 0.5, z),
     });
     world.addBody(body);
-    props.push({ mesh, body, explosive: true });
+    const prop = { mesh, body, explosive: true };
+    mesh.userData.prop = prop;
+    props.push(prop);
 }
 
 
@@ -181,6 +189,7 @@ const EYE_HEIGHT = 1.1;
 let health = 100;
 let ammo = 30;
 let partsFound = 0;
+let score = 0;
 let gameOver = false;
 let ready = false; // true once models finish loading
 
@@ -196,6 +205,8 @@ const messageEl = document.getElementById('message');
 const healthEl = document.getElementById('health');
 const ammoEl = document.getElementById('ammo');
 const partsEl = document.getElementById('parts');
+const scoreEl = document.getElementById('score');
+const crosshairEl = document.getElementById('crosshair');
 
 overlay.addEventListener('click', () => { if (ready && !gameOver) controls.lock(); });
 controls.addEventListener('lock', () => (overlay.style.display = 'none'));
@@ -209,6 +220,7 @@ function updateHUD() {
     healthEl.textContent = `Health: ${Math.max(0, Math.ceil(health))}`;
     ammoEl.textContent = `Ammo: ${ammo}`;
     partsEl.textContent = `Parts: ${partsFound}/3`;
+    scoreEl.textContent = `Score: ${score}`;
 }
 
 let messageTimer = null;
@@ -274,17 +286,36 @@ function createHusk(x, z) {
     });
     world.addBody(body);
 
-    husks.push({ mesh, body, hp: 3, speed: 3.5, aggroRange: 40});
+    husks.push({ mesh, body, hp: 3, speed: 3.5, aggroRange: 40, stun: 0, dead: false, deathTimer: 0 });
+    mesh.userData.husk = husk;
+    husks.push(husk);
 }
 
 function updateHusks(dt, time) {
-    for (const h of husks) {
+    // Loop backwards so removing a dead husk doesn't skip the next one
+    for (let i = husks.length - 1; i >= 0; i--) {
+        const h = husks[i];
+
+        // Dead husks: physics can fling them around before being removed
+        if (h.dead) {
+            h.mesh.position.copy(h.body.position);
+            h.mesh.quaternion.copy(h.body.quaternion);
+            h.deathTimer -= dt;
+            if (h.deathTimer <= 0) {
+                scene.remove(h.mesh);
+                world.removeBody(h.body);
+                husks.splice(i, 1);
+            }
+            continue;
+        }
+
         const dx = playerBody.position.x - h.body.position.x;
         const dz = playerBody.position.z - h.body.position.z;
         const dist = Math.hypot(dx, dz);
 
-        // Chase if player is in close enough range
-        if (dist < h.aggroRange && dist > 1.0) {
+        if (h.stun > 0) {
+            h.stun -= dt;
+        } else if (dist < h.aggroRange && dist > 1.0) {
             h.body.velocity.x = (dx / dist) * h.speed;
             h.body.velocity.z = (dz / dist) * h.speed;
         } else {
@@ -292,12 +323,10 @@ function updateHusks(dt, time) {
             h.body.velocity.z = 0;
         }
 
-        // Damage the player on contact
         if (dist < 1.5 && !gameOver) {
-            health -= 25 * dt; // 25 damage per second of contact
+            health -= 25 * dt;
         }
 
-        // Follow the physics body, shamble, face the player
         h.mesh.position.copy(h.body.position);
         h.mesh.position.y += Math.abs(Math.sin(time * 8)) * 0.05;
         h.mesh.lookAt(playerBody.position.x, h.mesh.position.y, playerBody.position.z);
@@ -339,6 +368,7 @@ function collect(p) {
 
     if (config.radio) {
         partsFound++;
+        score += 100;
         if (partsFound === 3) {
             showMessage('All parts found! Get to the radio tower.', 5);
         } else {
@@ -415,6 +445,64 @@ function buildWorld() {
 }
 
 
+//------------------------------------------------
+// Shooting & Barrel Explostions
+const raycaster = new THREE.Raycaster();
+const screenCenter = new THREE.Vector2(0, 0);
+const effects = [];
+
+// Reusable light for explosion flashes
+const blastLight = new THREE.PointLight(0xff8030, 0, 20);
+scene.add(blastLight);
+
+document.addEventListener('mousedown', () => {
+    if (e.button !== 0 || !controls.isLocked || gameOver) return;
+    shoot();
+});
+
+function flashRed(mesh) {
+    mesh.traverse((child) => {
+        if (child.isMesh && child.material.emissive) {
+            child.material.emissive.setHex(0xff0000);
+            setTimeout(() => child.material.emissive.setHex(0x000000), 100);
+        }
+    });
+}
+
+function hitMarker() {
+    crosshair.style.background = '#ff4040';
+    setTimeout(() => (crosshair.style.background = '#fff'), 100);
+}
+
+function killHusk(h, impulse) {
+    h.dead = true;
+    h.deathTimer = 1.5;
+
+    const q = h.mesh.quaternion;
+    h.body.quaternion.set(q.x, q.y, q.z, q.w);
+    h.body.fixedRotation = false;
+    h.body.updateMassProperties();
+    h.body.applyImpulse(impulse);
+    score += 100;
+}
+
+function shoot() {
+    if (ammo <= 0) {
+        showMessage('Out of ammo!', 1);
+        return;
+    }
+    ammo--;
+}
+
+//
+//
+// WORKING HERE !!!
+//
+//
+
+
+
+
 
 //------------------------------------------------
 // Game Loop
@@ -425,7 +513,7 @@ function animate() {
     const dt = Math.min(clock.getDelta(), 0.1);
     const time = clock.elapsedTime;
 
-    if (!gameOver) {
+    if (!gameOver && controls.isLocked) {
         updatePlayer();
         updateHusks(dt, time);
         updatePickups(dt, time);
