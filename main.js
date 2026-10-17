@@ -166,6 +166,8 @@ function spawnBarrel(x, z) {
         shape: new CANNON.Cylinder(0.35, 0.35, 1, 8),
         position: new CANNON.Vec3(x, 0.5, z),
     });
+    body.linearDamping = 0.4;
+    body.angularDamping = 0.6;
     world.addBody(body);
     const prop = { mesh, body, explosive: true };
     mesh.userData.prop = prop;
@@ -286,7 +288,7 @@ function createHusk(x, z) {
     });
     world.addBody(body);
 
-    husks.push({ mesh, body, hp: 3, speed: 3.5, aggroRange: 40, stun: 0, dead: false, deathTimer: 0 });
+    const husk = ({ mesh, body, hp: 3, speed: 3.5, aggroRange: 40, stun: 0, dead: false, deathTimer: 0 });
     mesh.userData.husk = husk;
     husks.push(husk);
 }
@@ -455,7 +457,7 @@ const effects = [];
 const blastLight = new THREE.PointLight(0xff8030, 0, 20);
 scene.add(blastLight);
 
-document.addEventListener('mousedown', () => {
+document.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || !controls.isLocked || gameOver) return;
     shoot();
 });
@@ -470,8 +472,8 @@ function flashRed(mesh) {
 }
 
 function hitMarker() {
-    crosshair.style.background = '#ff4040';
-    setTimeout(() => (crosshair.style.background = '#fff'), 100);
+    crosshairEl.style.background = '#ff4040';
+    setTimeout(() => (crosshairEl.style.background = '#fff'), 100);
 }
 
 function killHusk(h, impulse) {
@@ -487,18 +489,125 @@ function killHusk(h, impulse) {
 }
 
 function shoot() {
-    if (ammo <= 0) {
-        showMessage('Out of ammo!', 1);
-        return;
+        if (ammo <= 0) {
+            showMessage('Out of ammo!', 1);
+            return;
+        }
+        ammo--;
+
+
+    raycaster.setFromCamera(screenCenter, camera);
+    raycaster.far = 100;
+    const targets = [
+        ...husks.filter((h) => !h.dead).map((h) => h.mesh),
+        ...props.map((p) => p.mesh),
+        ...obstacles,
+    ];
+
+    const hits = raycaster.intersectObjects(targets, true);
+    if (hits.length === 0) return;
+
+    const hit = hits[0];
+    let obj = hit.object;
+    while (obj && !obj.userData.husk && !obj.userData.prop) obj = obj.parent;
+    if (!obj) return;
+
+    const dir = raycaster.ray.direction;
+
+    if (obj.userData.husk) {
+        const h = obj.userData.husk;
+        h.hp--;
+        flashRed(h.mesh);
+        hitMarker();
+        if (h.hp <= 0) {
+            killHusk(h, new CANNON.Vec3(dir.x * 400, 400, dir.z * 400));
+        } else {
+            h.stun = 0.3;
+            h.body.velocity.set(dir.x * 6, 0, dir.z * 6);
+        }
+    } else {
+        const p = obj.userData.prop;
+        if (p.explosive) {
+            explode(p);
+        } else {
+            const offset = new CANNON.Vec3(
+                hit.point.x - p.body.position.x,
+                hit.point.y - p.body.position.y,
+                hit.point.z - p.body.position.z
+            );
+            p.body.applyImpulse(new CANNON.Vec3(dir.x * 30, 5, dir.z * 30),offset)
+        }
     }
-    ammo--;
 }
 
-//
-//
-// WORKING HERE !!!
-//
-//
+function explode(p) {
+    const center = p.body.position;
+    
+    // Remove barrel from scene
+    scene.remove(p.mesh);
+    world.removeBody(p.body);
+    props.splice(props.indexOf(p), 1);
+
+    // generate a fireball that grows & fades
+    const fireball = new THREE.Mesh(
+        new THREE.SphereGeometry(0.5, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true, opacity: 0.9 })
+    );
+
+    fireball.position.copy(center);
+    scene.add(fireball);
+    blastLight.position.copy(center);
+    effects.push({ fireball, age: 0});
+
+    const RADIUS = 6;
+
+    // husks in range will die & get flung away
+    for (const h of husks) {
+        if (h.dead) continue;
+        if (h.body.position.distanceTo(center) < RADIUS) {
+            const away = h.body.position.vsub(center);
+            away.normalize();
+            killHusk(h, new CANNON.Vec3(away.x * 600, 700, away.z * 600));
+        }
+    }
+
+    // Crates get blasted, other barrels will chain-react and explode
+    for (const other of props) {
+        const d = other.body.position.distanceTo(center);
+        if (d < RADIUS) {
+            const away = other.body.position.vsub(center);
+            away.normalize();
+            const push = (1 - d / RADIUS) * other.body.mass * 15;
+            other.body.applyImpulse(new CANNON.Vec3(away.x * push, push, away.z * push));
+            if (other.explosive) {
+                setTimeout(() => { if (props.includes(other)) explode(other); }, 150);
+            }
+        }
+    }
+    // If player is standing too close, they take damage
+    const playerDist = playerBody.position.distanceTo(center);
+    if (playerDist < RADIUS) {
+        health -= 40 * (1 - playerDist / RADIUS);
+    }
+}
+
+
+function updateEffects(dt) {
+    for (let i = effects.length - 1; i >= 0; i--) {
+        const e = effects[i];
+        e.age += dt;
+        const t = e.age / 0.5;
+        e.fireball.scale.setScalar(1 + t * 5);
+        e.fireball.material.opacity = 0.9 * (1 - t);
+        blastLight.intensity = 40 * (1 - t);
+        if (t >= 1) {
+            scene.remove(e.fireball);
+            blastLight.intensity = 0;
+            effects.splice(i, 1);
+        }
+    }
+}
+
 
 
 
@@ -517,6 +626,7 @@ function animate() {
         updatePlayer();
         updateHusks(dt, time);
         updatePickups(dt, time);
+        updateEffects(dt);
         world.step(1 / 60, dt, 3);
     }
 
