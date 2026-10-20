@@ -154,10 +154,12 @@ function createBox(w, h, d, x, z, color, mass = 0) {
 const SHOW_COLLIDERS = false;
 
 function addStaticCollider(w, h, d, x, z, rotY = 0) {
+    const ph = h < 0.05 ? h : Math.max(h, 6);
+
     const body = new CANNON.Body({
         mass: 0,
-        shape: new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)),
-        position: new CANNON.Vec3(x, h / 2, z),
+        shape: new CANNON.Box(new CANNON.Vec3(w / 2, ph / 2, d / 2)),
+        position: new CANNON.Vec3(x, ph / 2, z),
     });
     body.quaternion.setFromEuler(0, rotY, 0);
     world.addBody(body);
@@ -167,7 +169,7 @@ function addStaticCollider(w, h, d, x, z, rotY = 0) {
             new THREE.BoxGeometry(w, h, d),
             new THREE.MeshStandardMaterial({ color: 0x00ff00, wireframe: true })
         );
-        debug.position.set(x, h / 2, z);
+        debug.position.set(x, ph / 2, z);
         debug.rotation.y = rotY;
         scene.add(debug);
     }
@@ -488,17 +490,7 @@ function buildSchoolBus(x, z) {
     part(g, 1.0, 0.12, 0.65, -4.8, 0.08, -1.8, DARK, 0, 0.5, 0.1);
     part(g, 0.8, 0.18, 0.6, 5.8, 0.1, -1.8, METAL, 0, 0.3, 0.05);
 
-    // Place the bus
-    finishBuilding(g, x, z);
-
-    // Colliders: main body and front hood; wheel boxes
-    addStaticCollider(9.0, 1.65, 2.7, x, z);
-    addStaticCollider(2.3, 1.4, 2.7, x + 3.2, z);
-    addStaticCollider(1.9, 0.65, 2.5, x + 4.9, z);
-    for (const wx of [-3.2, 2.8]) {
-        addStaticCollider(0.75, 0.9, 0.35, x + wx, z + 1.35);
-        addStaticCollider(0.75, 0.9, 0.35, x + wx, z - 1.35);
-    }
+    return g;
 }
 
 
@@ -535,6 +527,39 @@ function spawnBarrel(x, z) {
     props.push(prop);
 }
 
+// Darken the bus to make it look burnt on explosion
+    function charModel(mesh) {
+        mesh.traverse((c) => {
+            if (c.isMesh) c.material.color.multiplyScalar(0.35);
+        });
+    }
+
+
+function spawnBus(x, z) {
+    const busModel = buildSchoolBus();
+    busModel.position.y = -1.4;
+
+    const holder = new THREE.Group();
+    holder.add(busModel);
+    scene.add(holder);
+
+    const body = new CANNON.Body({
+        mass: 0,
+        position: new CANNON.Vec3(x, 1.4, z),
+    });
+
+    body.addShape(new CANNON.Box(new CANNON.Vec3(5.25, 1.4, 1.35)), new CANNON.Vec3(0.75, 0, 0));
+    body.linearDamping = 0.5;
+    body.angularDamping = 0.6;
+    world.addBody(body);
+
+    const prop = { mesh: holder, body, dormant: true, blastScale: 8};
+    holder.userData.prop = prop;
+    props.push(prop);
+}
+
+
+
 
 //------------------------------------------------
 // Player
@@ -546,6 +571,23 @@ const playerBody = new CANNON.Body({
     fixedRotation: true, // don't let the sphere roll
 });
 world.addBody(playerBody);
+
+// Ground check, only allow jumping after landing on something (ground or object)
+let canJump = false;
+const upAxis = new CANNON.Vec3(0, 1, 0);
+const contactNormal = new CANNON.Vec3();
+
+playerBody.addEventListener('collide', (e) => {
+    const contact = e.contact;
+    // The contact normal points from body "bi" to body "bj", so flip it if the player is "bi"
+    if (contact.bi.id === playerBody.id) {
+        contact.ni.negate(contactNormal);
+    } else {
+        contactNormal.copy(contact.ni);
+    }
+    // if the surface we touched faces mostly upward, it's a floor
+    if (contactNormal.dot(upAxis) > 0.5) canJump = true;
+});
 
 // camera height right above the sphere's center
 const EYE_HEIGHT = 1.1;
@@ -638,8 +680,9 @@ function updatePlayer() {
     playerBody.velocity.z = move.z;
 
     // Simple jump: can't do if moving vertically already
-    if (keys.Space && Math.abs(playerBody.velocity.y) < 0.1) {
+    if (keys.Space && canJump) {
         playerBody.velocity.y = 8;
+        canJump = false;
     }
 
     // Camera follows the physics body
@@ -784,12 +827,69 @@ function updatePickups(dt, time) {
 
 
 //------------------------------------------------
+// Game Easter Eggs
+
+const secrets = [];
+let secretsFound = 0;
+
+// Building a small object from boxes and registering it as a secret
+function addSecret(x, z, build, message) {
+    const g = new THREE.Group();
+    build(g);
+    g.position.set(x, 0, z);
+    scene.add(g);
+    secrets.push({ x, z, message, found: false });
+}
+
+function buildSecrets() {
+    // 1. Survivor's note on the floor inside collapsed house
+    addSecret(-37.5, 13.5, (g) => {
+        part(g, 0.3, 0.002, 0.4, 0, 0.01, 0, 0xe8e0c8, 0, 0.4, 0);
+        part(g, 0.2, 0.025, 0.03, 0, 0.012, -0.05, 0x333333, 0, 0.3, 0);
+        part(g, 0.2, 0.025, 0.03, 0, 0.012, 0.05, 0x333333, 0, 0.4, 0);
+    }, 'A scrawled note: "Day 212. The Bloom took Marcus today. Tower 9 still has power... I think"');
+
+    // 2. A lonely teddy bear out in the wasteland
+    addSecret(55, -45, (g) => {
+        const FUR = 0x9c7a55;
+        part(g, 0.35, 0.4, 0.25, 0, 0.2, 0, FUR);
+        part(g, 0.3, 0.28, 0.25, 0, 0.54, 0, FUR);
+        part(g, 0.1, 0.1, 0.06, -0.12, 0.72, 0, FUR);
+        part(g, 0.1, 0.1, 0.06, 0.12, 0.72, 0, FUR);
+        part(g, 0.04, 0.04, 0.02, 0.06, 0.56, 0.13, 0x111111);
+        part(g, 0.1, 0.1, 0.05, 0, 0.48, 0.13, 0xc4a77f);
+    }, 'A sun bleached teddy bear, missing an eye. Someone loved this once. I wonder if they made it out.' );
+
+    // RIP (;
+    addSecret(-12, -62, (g) => {
+        part(g, 0.8, 0.15, 1.4, 0, 0.07, 0, 0x6e5a48);
+        part(g, 0.1, 1.0, 0.1, 0, 0.5, -0.6, 0x594638);
+        part(g, 0.5, 0.1, 0.1, 0, 0.75, -0.6, 0x594638);
+    }, 'Here lies Renee\'s sleep schedule. 2026-2026. Gone but not forgotten');
+
+}
+
+function updateSecrets() {
+    for (const s of secrets) {
+        if (s.found) continue;
+        const dist = Math.hypot(playerBody.position.x - s.x, playerBody.position.z - s.z);
+        if (dist < 2) {
+            s.found = true;
+            secretsFound++;
+            score += 50;
+            showMessage(`${s.message} (Secret ${secretsFound}/${secrets.length})`, 5);
+        }
+    }
+}
+
+
+//------------------------------------------------
 // World Building
 function buildStaticWorld() {
     buildGasStation(30, -20);
     buildCollapsedHouse(-35, 15);
-    buildSchoolBus(10, 30);
     buildRadioTower(TOWER_POS.x, TOWER_POS.z);
+    buildSecrets();
 
     // rocks (visual only)
     for (let i = 0; i < 80; i++) {
@@ -805,11 +905,15 @@ function buildStaticWorld() {
 
 // To be called at startup and anytime the player presses 'R'
 function spawnEntities() {
+    // Bus
+    spawnBus(10, 30);
+
     // Crates + Barrels
     for (let i = 0; i < 4; i++) spawnCrate (-5 + i * 1.5, -8);
     spawnBarrel(18, -5);
     spawnBarrel(19, -6.2);
     spawnBarrel(-22, 8);
+    spawnBarrel(10, 27);
 
     // Barrels around the tower for evacuation waves
     spawnBarrel(-6, -44);
@@ -825,7 +929,7 @@ function spawnEntities() {
     // One radio part at each location
     spawnPickup('battery', 30, -13); // in front of the gas station
     spawnPickup('coil', -35, 13); // inside the house
-    spawnPickup('transmitter', 12, 33); // beside the bus
+    spawnPickup('transmitter', 17.5, 27.3); // beside the bus
 
     // Supplies
     spawnPickup('medkit', -10, 0);
@@ -1068,10 +1172,25 @@ function explode(p) {
     for (const other of props) {
         const d = other.body.position.distanceTo(center);
         if (d < RADIUS) {
+            // frozen props come to life if the blast hits them
+            if (other.dormant) {
+                other.dormant = false;
+                other.body.type = CANNON.Body.DYNAMIC;
+                other.body.mass = 800;
+                other.body.updateMassProperties();
+                other.body.wakeUp();
+                charModel(other.mesh);
+            }
+
             const away = other.body.position.vsub(center);
             away.normalize();
-            const push = (1 - d / RADIUS) * other.body.mass * 15;
-            other.body.applyImpulse(new CANNON.Vec3(away.x * push, push, away.z * push));
+            const strength = other.blastScale || 15;
+            const push = (1 - d / RADIUS) * other.body.mass * strength;
+            other.body.applyImpulse(
+                new CANNON.Vec3(away.x * push, push, away.z * push),
+                new CANNON.Vec3(0, 0.6, 0)
+            );
+
             if (other.explosive) {
                 setTimeout(() => { if (props.includes(other)) explode(other); }, 150);
             }
@@ -1183,6 +1302,9 @@ function resetGame() {
     clearEntities();
     spawnEntities();
 
+    for (const s of secrets) s.found = false;
+    secretsFound = 0;
+
     playerBody.position.set(0, 2, 10);
     playerBody.velocity.set(0, 0, 0);
     camera.position.set(0, 2 + EYE_HEIGHT, 10);
@@ -1220,6 +1342,7 @@ function animate() {
         updatePlayer();
         updateHusks(dt, time);
         updatePickups(dt, time);
+        updateSecrets();
         updateTower(dt, time);
         updateEffects(dt);
         world.step(1 / 60, dt, 3);
