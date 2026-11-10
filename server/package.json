@@ -1,0 +1,16 @@
+{
+  "name": "last-signal-server",
+  "version": "1.0.0",
+  "description": "Multiplayer server for The Last Signal",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  }
+}

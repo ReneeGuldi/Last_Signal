@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as CANNON from 'cannon-es';
+import { initNetwork, sendState, sendShot, sendProfile, updateRemotePlayers } from './net.js';
 
 // Creating the Renderer, Scene, and Game Camera
 const renderer = new THREE.WebGLRenderer({ antialias: true});
@@ -33,6 +34,7 @@ sun.shadow.mapSize.set(2048, 2048);
 // The shadow camera is a box, only letting things inside of it get shadows
 Object.assign(sun.shadow.camera, { left: -60, right: 60, top: 60, bottom: -60});
 scene.add(sun);
+scene.add(sun.target); // sun aims at its target which follows the player
 
 // Game Physics through cannon-es
 // Physics will run in its own invisible world, where each frame we copy the
@@ -63,7 +65,7 @@ world.addBody(groundBody);
 // Loading Blockbench models
 // All models load at once before the game starts
 const MODEL_FILES = {
-    husk: 'models/husk.gltf',
+    husk: 'models/husk_new_1.gltf',
     battery: 'models/battery.gltf',
     coil: 'models/coil.gltf',
     transmitter: 'models/transmitter.gltf',
@@ -71,6 +73,10 @@ const MODEL_FILES = {
     medkit: 'models/medkit.gltf',
     crate: 'models/crate.gltf',
     ammo: 'models/ammo.gltf',
+    female: 'models/player_female.gltf',
+    male: 'models/player_male.gltf',
+    pistol: 'models/pistol.gltf',
+    shotgun: 'models/shotgun.gltf',
 };
 
 const models = {};
@@ -623,15 +629,47 @@ const objectiveEl = document.getElementById('objective');
 
 
 overlay.addEventListener('click', () => { if (ready && !gameOver) controls.lock(); });
-controls.addEventListener('lock', () => (overlay.style.display = 'none'));
+controls.addEventListener('lock', () => {
+    overlay.style.display = 'none';
+    document.activeElement.blur(); // take focus off the name box so WASD/F/R reach the game
+    updateProfile();
+});
 controls.addEventListener('unlock', () => (overlay.style.display = 'flex'));
 
 const keys = {};
-document.addEventListener('keydown', (e) =>  {
-    keys[e.code] = true;
+document.addEventListener('keydown', (e) => { 
+    if (e.target.tagName === 'INPUT') return;
+    keys[e.code] = true; 
     if (e.code === 'KeyR' && ready) resetGame();
+    if (e.code === 'KeyF' && controls.isLocked && !gameOver) shove();
 });
+document.getElementById('profile').addEventListener('click', (e) => e.stopPropagation());
 document.addEventListener('keyup', (e) => (keys[e.code] = false));
+
+// Name & character picker on the start screen
+const nameInput = document.getElementById('name-input');
+const youEl = document.getElementById('you');
+const playersEl = document.getElementById('players');
+const pickButtons = document.querySelectorAll('#profile button');
+let pickedModel = 'female';
+pickButtons[0].classList.add('selected');
+playersEl.textContent = 'Playing solo';
+
+function myProfile() {
+    return { name: nameInput.value.trim() || 'Survivor', model: pickedModel };
+}
+function updateProfile() {
+    sendProfile(myProfile());
+    youEl.textContent = `You: ${myProfile().name}`;
+}
+for (const btn of pickButtons) {
+    btn.addEventListener('click', () => {
+        pickedModel = btn.dataset.model;
+        pickButtons.forEach((b) => b.classList.toggle('selected', b === btn));
+        updateProfile();
+    });
+}
+nameInput.addEventListener('change', updateProfile);
 
 function updateHUD() {
     healthEl.textContent = `Health: ${Math.max(0, Math.ceil(health))}`;
@@ -639,28 +677,28 @@ function updateHUD() {
     partsEl.textContent = `Parts: ${partsFound}/3`;
     scoreEl.textContent = `Score: ${score}`;
 
-    if (towerState === 'broadcasting') {
-        objectiveEl.textContent = `SURVIVE! Evac in ${Math.ceil(evacTimer)}s`;
-    } else if (partsFound < 3) {
-        objectiveEl.textContent = `Objective: find the radio parts (${partsFound}/3)`;
-    } else {
-        objectiveEl.textContent = 'Objective: get to the radio tower';
+    if (towerState === 'landing') {
+        objectiveEl.textContent = `Hold the landing zone! Chopper lands in ${Math.ceil(evacTimer)}s`;
+    }   else if (towerState === 'broadcasting') {
+        objectiveEl.textContent = `Objective: Follow the road south to the landing zone`;
+    }   else if (partsFound < 3) {
+        objectiveEl.textContent = `Objective: Find the radio parts (${partsFound}/3)`;
+    }   else {
+        objectiveEl.textContent = `Objective: Get to the radio tower!`;
     }
 }
 
-let messageTimer = null;
-function showMessage(text, seconds = 2.5) {
-    messageEl.textContent = text;
-    clearTimeout(messageTimer);
-    messageTimer = setTimeout(() => (messageEl.textContent = ''), seconds * 1000);
-}
+// Knockback from explosions & hits
+const knockback = new THREE.Vector3();
+// 1 = normal speed, lower while going through barbed wire (set by updateHazards)
+let hazardSlow = 1;
 
-function updatePlayer() {
+function updatePlayer(dt) {
     if (!controls.isLocked) return;
 
-    const speed = keys.ShiftLeft ? 12 : 6;
+    const speed = (keys.ShiftLeft ? 12 : 6) * hazardSlow;
 
-    // Which way is the camera facing? If looking down, this should NOT slow player.
+    // which way is the camera facing - if looking down, don't slow the player
     const forward = new THREE.Vector3();
     camera.getWorldDirection(forward);
     forward.y = 0;
@@ -670,27 +708,48 @@ function updatePlayer() {
     const move = new THREE.Vector3();
     if (keys.KeyW) move.add(forward);
     if (keys.KeyS) move.sub(forward);
-    if (keys.KeyD) move.add(right);
     if (keys.KeyA) move.sub(right);
+    if (keys.KeyD) move.add(right);
     move.normalize().multiplyScalar(speed);
 
-    // Setting horizontal velocity directional
+    // Setting horizontal velocity directional (plus any knockback)
     // leave vertical to gravity
-    playerBody.velocity.x = move.x;
-    playerBody.velocity.z = move.z;
+    playerBody.velocity.x = move.x + knockback.x;
+    playerBody.velocity.z = move.z + knockback.z;
+    knockback.multiplyScalar(Math.max(0, 1 - dt * 6));
 
-    // Simple jump: can't do if moving vertically already
     if (keys.Space && canJump) {
         playerBody.velocity.y = 8;
         canJump = false;
     }
 
-    // Camera follows the physics body
+    // camera follows physics body
     camera.position.set(
         playerBody.position.x,
         playerBody.position.y + EYE_HEIGHT,
         playerBody.position.z
     );
+}
+
+// Anything that hurts the player (hazards, husks, etc) should call this to apply knockback and damage and flash the screen red
+const hurtEl = document.getElementById('hurt');
+let hurtTimer = null;
+function hurtPlayer(amount, fromPos = null, push = 0) {
+    if (gameOver) return;
+    health -= amount;
+
+    hurtEl.style.opacity = Math.min(0.8, 0.25 + amount / 40);
+    clearTimeout(hurtTimer);
+    hurtTimer = setTimeout(() => (hurtEl.style.opacity = 0), 120);
+
+    if (fromPos && push > 0) {
+        const dx = playerBody.position.x - fromPos.x;
+        const dz = playerBody.position.z - fromPos.z;
+        const d = Math.hypot(dx, dz) || 1;
+        knockback.x += (dx / d) * push;
+        knockback.z += (dz / d) * push;
+        if (push > 10) playerBody.velocity.y = 5; // big hits pop the player up a bit
+    }
 }
 
 
@@ -699,22 +758,91 @@ function updatePlayer() {
 // Husks
 const husks = [];
 const HUSK_TURN = 0;
+const HUSK_MODEL_SCALE = 2.4;
 
-function createHusk(x, z) {
-    const mesh = spawnModel('husk', 1, -0.5);
+const HUSK_TYPES = {
+    normal: { hp: 3, speed: 3.5, scale: 1, tint: null, damage: 15, aggroRange: 30, score: 100, drop: 0.3,
+                lungeRange: 4.5, windup: 0.4, lungeSpeed: 11, lungeTime: 0.3 },
+    runner: { hp: 1, speed: 7, scale: 0.75, tint: 0xd07040, damage: 8, aggroRange: 35, score: 75, drop: 0.15,
+              lungeRange: 5, windup: 0.25, lungeSpeed: 16, lungeTime: 0.3 },
+    brute:  { hp: 12, speed: 2.2, scale: 1.6, tint: 0x6a2a2a, damage: 30, aggroRange: 25, score: 300, drop: 1,
+              lungeRange: 12, windup: 0.9, lungeSpeed: 14, lungeTime: 0.7, heavy: true },
+}
+
+// home: if given, the husk is a guard. It shuffles around home, only notices you
+//       inside guardRadius, and walks back if you lead it too far away.
+// alerted: spawn already hunting the player (ambushes, nest spawns, evac waves)
+function createHusk(x, z, type = 'normal', { home = null, guardRadius = 12, alerted = false } = {}) {
+    const t = HUSK_TYPES[type];
+    const radius = 0.5 * t.scale;
+    const mesh = spawnModel('husk', t.scale * HUSK_MODEL_SCALE, -radius);
     mesh.children[0].rotation.y = HUSK_TURN;
 
+    if (t.tint) {
+        const tint = new THREE.Color(t.tint);
+        mesh.traverse((c) => { if (c.isMesh) c.material.color.lerp(tint, 0.6); });
+    }
+
     const body = new CANNON.Body({
-        mass: 50,
-        shape: new CANNON.Sphere(0.5),
-        position: new CANNON.Vec3(x, 0.5, z),
+        mass: t.heavy ? 200 : 50,
+        shape: new CANNON.Sphere(radius),
+        position: new CANNON.Vec3(x, radius, z),
         fixedRotation: true,
     });
     world.addBody(body);
 
-    const husk = ({ mesh, body, hp: 3, speed: 3.5, aggroRange: 40, stun: 0, dead: false, deathTimer: 0 });
+    const husk = {
+        type, t, mesh, body, radius,
+        hp: t.hp, stun: 0, dead: false, deathTimer: 0,
+        mode: home ? 'guard' : 'idle', // idle, guard, return, chase, windup, lunge
+        modeTimer: 0,
+        lungeDir: new THREE.Vector3(),
+        lungeCooldown: 0,
+        attackCooldown: 0,
+        alertTimer: alerted ? 8 : 0,
+        home: home ? { x: home.x, z: home.z } : null,
+        guardRadius,
+        wanderTarget: null,
+        wanderTimer: 0,
+    };
     mesh.userData.husk = husk;
     husks.push(husk);
+    return husk;
+}
+
+// Spawn a list like [['runner', x, z], ['brute', x, z]] already hunting the player
+function spawnGroup(list) {
+    for (const [type, x, z] of list) createHusk(x, z, type, { alerted: true });
+}
+
+// Wake up every husk within radius of a point (gunshots, explosions, screams)
+function alertHusks(x, z, radius) {
+    for (const h of husks) {
+        if (h.dead) continue;
+        if (Math.hypot(h.body.position.x - x, h.body.position.z - z) < radius) {
+            h.alertTimer = Math.max(h.alertTimer, 8);
+        }
+    }
+}
+
+function setGlow(mesh, hex) {
+    mesh.traverse((c) => {
+        if (c.isMesh && c.material.emissive) c.material.emissive.setHex(hex);
+    });
+}
+
+function moveToward(h, tx, tz, speed) {
+    const dx = tx - h.body.position.x;
+    const dz = tz - h.body.position.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.1) {
+        h.body.velocity.x = 0;
+        h.body.velocity.z = 0;
+    } else {
+        h.body.velocity.x = (dx / d) * speed;
+        h.body.velocity.z = (dz / d) * speed;
+    }
+    return d;
 }
 
 function updateHusks(dt, time) {
@@ -735,44 +863,169 @@ function updateHusks(dt, time) {
             continue;
         }
 
-        const dx = playerBody.position.x - h.body.position.x;
-        const dz = playerBody.position.z - h.body.position.z;
+        const px = playerBody.position.x;
+        const pz = playerBody.position.z;
+        const dx = px - h.body.position.x;
+        const dz = pz - h.body.position.z;
         const dist = Math.hypot(dx, dz);
+        const inner = h.mesh.children[0];
+        inner.scale.y = h.t.scale * HUSK_MODEL_SCALE; // undo the wind-up crouch
+
+        h.alertTimer -= dt;
+        h.lungeCooldown -= dt;
+        h.attackCooldown -= dt;
+
+        const hunting = h.mode === 'chase' || h.mode === 'windup' || h.mode === 'lunge';
 
         if (h.stun > 0) {
+            // knocked back: slide to a stop, any lunge is cancelled
             h.stun -= dt;
-        } else if (dist < h.aggroRange && dist > 1.0) {
-            h.body.velocity.x = (dx / dist) * h.speed;
-            h.body.velocity.z = (dz / dist) * h.speed;
-        } else {
+            const slow = Math.max(0, 1 - dt * 5);
+            h.body.velocity.x *= slow;
+            h.body.velocity.z *= slow;
+            if (h.mode === 'windup' || h.mode === 'lunge') {
+                h.mode = 'chase';
+                setGlow(h.mesh, 0x000000);
+            }
+        } else if (!hunting) {
+            const noticeRange = h.home ? h.guardRadius : h.t.aggroRange;
+            if (dist < noticeRange || h.alertTimer > 0) {
+                // A husk that spots you on its own screams and wakes its friends
+                if (h.alertTimer <= 0) alertHusks(h.body.position.x, h.body.position.z, 15);
+                h.mode = 'chase';
+            } else if (h.mode === 'return') {
+                if (moveToward(h, h.home.x, h.home.z, h.t.speed) < 1.5) h.mode = 'guard';
+            } else if (h.mode === 'guard') {
+                // shuffle around near home
+                h.wanderTimer -= dt;
+                if (h.wanderTimer <= 0 || !h.wanderTarget) {
+                    h.wanderTimer = 2 + Math.random() * 3;
+                    const a = Math.random() * Math.PI * 2;
+                    const r = Math.random() * h.guardRadius * 0.4;
+                    h.wanderTarget = { x: h.home.x + Math.cos(a) * r, z: h.home.z + Math.sin(a) * r };
+                }
+                moveToward(h, h.wanderTarget.x, h.wanderTarget.z, h.t.speed * 0.3);
+            } else {
+                h.body.velocity.x = 0;
+                h.body.velocity.z = 0;
+            }
+        } else if (h.mode === 'chase') {
+            const interested = dist < h.t.aggroRange * 1.4 || h.alertTimer > 0;
+            const farFromHome = h.home &&
+                Math.hypot(h.body.position.x - h.home.x, h.body.position.z - h.home.z) > 35;
+
+            if (!interested || (farFromHome && dist > 10 && h.alertTimer <= 0)) {
+                // lost interest: guards go home, wanderers just stop
+                h.mode = h.home ? 'return' : 'idle';
+            } else if (dist < h.t.lungeRange && dist > 1.2 && h.lungeCooldown <= 0) {
+                h.mode = 'windup';
+                h.modeTimer = h.t.windup;
+                setGlow(h.mesh, 0x663300);
+            } else if (dist > h.radius + 0.6) {
+                moveToward(h, px, pz, h.t.speed);
+            } else {
+                h.body.velocity.x = 0;
+                h.body.velocity.z = 0;
+            }
+        } else if (h.mode === 'windup') {
+            // crouch and glow so the player can see the lunge coming and sidestep
+            h.modeTimer -= dt;
+            inner.scale.y = h.t.scale * HUSK_MODEL_SCALE * 0.8;
             h.body.velocity.x = 0;
             h.body.velocity.z = 0;
+            if (h.modeTimer <= 0) {
+                h.mode = 'lunge';
+                h.modeTimer = h.t.lungeTime;
+                h.lungeDir.set(dx, 0, dz).normalize();
+                setGlow(h.mesh, 0x000000);
+            }
+        } else if (h.mode === 'lunge') {
+            h.modeTimer -= dt;
+            h.body.velocity.x = h.lungeDir.x * h.t.lungeSpeed;
+            h.body.velocity.z = h.lungeDir.z * h.t.lungeSpeed;
+            if (h.modeTimer <= 0) {
+                h.mode = 'chase';
+                h.lungeCooldown = 2 + Math.random();
+            }
         }
 
-        if (dist < 1.5 && !gameOver) {
-            health -= 25 * dt;
+        // Melee hit: one solid hit per second instead of constant drain
+        if (dist < h.radius + 1.0 && h.attackCooldown <= 0 && h.stun <= 0 && !gameOver) {
+            h.attackCooldown = h.t.heavy ? 1.5 : 1;
+            hurtPlayer(h.t.damage, h.body.position, h.t.heavy ? 16 : 6);
+            if (h.mode === 'lunge') {
+                h.mode = 'chase';
+                h.lungeCooldown = 2;
+            }
         }
 
         h.mesh.position.copy(h.body.position);
-        h.mesh.position.y += Math.abs(Math.sin(time * 8)) * 0.05;
-        h.mesh.lookAt(playerBody.position.x, h.mesh.position.y, playerBody.position.z);
+        h.mesh.position.y += Math.abs(Math.sin(time * (h.mode === 'lunge' ? 20 : 8))) * 0.05;
+
+        // face the player when hunting, otherwise face the way it's walking
+        const vx = h.body.velocity.x;
+        const vz = h.body.velocity.z;
+        if (h.mode === 'chase' || h.mode === 'windup') {
+            h.mesh.lookAt(px, h.mesh.position.y, pz);
+        } else if (Math.hypot(vx, vz) > 0.2) {
+            h.mesh.lookAt(h.mesh.position.x + vx, h.mesh.position.y, h.mesh.position.z + vz);
+        }
     }
+}
+
+// dir: direction the hit came from (pushes the husk that way)
+// force: multiplies how hard a killing blow flings the body
+function damageHusk(h, amount, dir, force = 1) {
+    if (h.dead) return;
+    h.hp -= amount;
+    h.alertTimer = Math.max(h.alertTimer, 8); // getting hurt makes them angry
+    flashRed(h.mesh);
+
+    if (h.hp <= 0) {
+        killHusk(h, new CANNON.Vec3(dir.x * 400 * force, 400 * force, dir.z * 400 * force));
+    } else if (!h.t.heavy) {
+        // brutes shrug off bullets, everything else staggers
+        h.stun = 0.3;
+        h.body.velocity.set(dir.x * 6, 0, dir.z * 6);
+    }
+}
+
+function killHusk(h, impulse) {
+    if (h.dead) return;
+    h.dead = true;
+    h.deathTimer = 1.5;
+    setGlow(h.mesh, 0x000000);
+
+    const q = h.mesh.quaternion;
+    h.body.quaternion.set(q.x, q.y, q.z, q.w);
+    h.body.fixedRotation = false;
+    h.body.updateMassProperties();
+    h.body.applyImpulse(impulse.scale(h.body.mass / 50));
+    score += h.t.score;
+
+    // Loot! Dropped pickups vanish after a while
+    const x = h.body.position.x;
+    const z = h.body.position.z;
+    if (Math.random() < h.t.drop) spawnPickup('ammo', x, z, { temporary: true });
+    if (h.type === 'brute') spawnPickup('medkit', x + 1, z, { temporary: true });
 }
 
 
 //------------------------------------------------
 // Item Pick Ups
+// respawn: seconds before a collected supply comes back (radio parts never respawn)
 const PICKUP_TYPES = {
     battery:        { model: 'battery', scale: 2, radio: true, name: 'the battery' },
     coil:           { model: 'coil', scale: 1.5, radio: true, name: 'the antenna coil' },
     transmitter:    { model: 'transmitter', scale: 2, radio: true, name: 'the transmitter' },
-    medkit:         { model: 'medkit', scale: 1.5 },
-    ammo:           { model: 'ammo', scale: 1.5 },
+    medkit:         { model: 'medkit', scale: 1.5, respawn: 60 },
+    ammo:           { model: 'ammo', scale: 1.5, respawn: 40 },
 };
 
 const pickups = [];
 
-function spawnPickup(type, x, z) {
+// temporary: loot dropped by husks/nests. Blinks and disappears after 25s, never respawns
+function spawnPickup(type, x, z, { temporary = false } = {}) {
     const config = PICKUP_TYPES[type];
     const mesh = spawnModel(config.model, config.scale, 0);
     mesh.position.set(x, 0.6, z);
@@ -784,13 +1037,25 @@ function spawnPickup(type, x, z) {
         mesh.add(glow);
     }
 
-    pickups.push({ type, mesh, collected: false });
+    const p = { type, mesh, collected: false, respawnTimer: 0, temporary, life: 25 };
+    pickups.push(p);
+    return p;
 }
 
 function collect(p) {
-    p.collected = true;
-    scene.remove(p.mesh);
     const config = PICKUP_TYPES[p.type];
+
+    // don't waste a medkit at full health, leave it for later
+    if (p.type === 'medkit' && health >= 100) return;
+
+    p.collected = true;
+    if (config.radio || p.temporary) {
+        scene.remove(p.mesh);
+    } else {
+        // hide it and start the respawn countdown
+        p.mesh.visible = false;
+        p.respawnTimer = config.respawn;
+    }
 
     if (config.radio) {
         partsFound++;
@@ -811,8 +1076,32 @@ function collect(p) {
 
 
 function updatePickups(dt, time) {
-    for (const p of pickups) {
-        if (p.collected) continue;
+    for (let i = pickups.length - 1; i >= 0; i--) {
+        const p = pickups[i];
+
+        if (p.collected) {
+            if (p.respawnTimer > 0) {
+                p.respawnTimer -= dt;
+                if (p.respawnTimer <= 0) {
+                    p.collected = false;
+                    p.mesh.visible = true;
+                }
+            } else {
+                pickups.splice(i, 1); // radio parts & loot are gone for good
+            }
+            continue;
+        }
+
+        if (p.temporary) {
+            p.life -= dt;
+            if (p.life <= 0) {
+                scene.remove(p.mesh);
+                pickups.splice(i, 1);
+                continue;
+            }
+            // blink during the last 5 seconds
+            p.mesh.visible = p.life > 5 || Math.sin(time * 20) > 0;
+        }
 
         p.mesh.rotation.y += dt * 1.5;
         p.mesh.position.y = 0.6 + Math.sin(time * 2) * 0.15;
@@ -824,7 +1113,6 @@ function updatePickups(dt, time) {
         if (dist < 1.5) collect(p);
     }
 }
-
 
 //------------------------------------------------
 // Game Easter Eggs
@@ -882,6 +1170,918 @@ function updateSecrets() {
     }
 }
 
+//------------------------------------------------
+// Bloom Nests
+// Glowing pods inside buildings that keep spawning husks until you shoot them
+const nests = [];
+const NEST_GLOW = 0x66ff44;
+
+function spawnNest(x, z) {
+    const g = new THREE.Group();
+
+    const pod = new THREE.Mesh(
+        new THREE.SphereGeometry(0.8, 12, 10),
+        new THREE.MeshStandardMaterial({ color: 0x3f6a2a, emissive: NEST_GLOW, emissiveIntensity: 0.5, flatShading: true })
+    );
+    pod.position.y = 0.9;
+    g.add(pod);
+
+    // roots spreading out across the floor
+    for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2;
+        part(g, 0.15, 0.1, 1.6, Math.cos(a) * 1.1, 0.05, Math.sin(a) * 1.1, 0x2f4a22, 0, Math.PI / 2 - a, 0);
+    }
+
+    const light = new THREE.PointLight(NEST_GLOW, 4, 10);
+    light.position.y = 1;
+    g.add(light);
+
+    g.position.set(x, 0, z);
+    scene.add(g);
+
+    const nest = { group: g, pod, x, z, hp: 12, spawnTimer: 3, dead: false };
+    g.userData.nest = nest;
+    nests.push(nest);
+}
+
+function updateNests(dt, time) {
+    for (const n of nests) {
+        if (n.dead) continue;
+
+        // slow breathing pulse
+        const pulse = 1 + Math.sin(time * 3) * 0.06;
+        n.pod.scale.set(pulse, 1.3 * pulse, pulse);
+
+        // only active while the player is nearby
+        const dist = Math.hypot(playerBody.position.x - n.x, playerBody.position.z - n.z);
+        if (dist > 35) continue;
+
+        n.spawnTimer -= dt;
+        if (n.spawnTimer > 0) continue;
+        n.spawnTimer = 10;
+
+        // cap how many husks one nest can have around it
+        const nearby = husks.filter((h) => !h.dead &&
+            Math.hypot(h.body.position.x - n.x, h.body.position.z - n.z) < 15).length;
+        if (nearby >= 5) continue;
+
+        const a = Math.random() * Math.PI * 2;
+        createHusk(n.x + Math.cos(a) * 1.5, n.z + Math.sin(a) * 1.5,
+            Math.random() < 0.3 ? 'runner' : 'normal',
+            { home: { x: n.x, z: n.z }, alerted: dist < 20 });
+    }
+}
+
+function damageNest(n, amount) {
+    if (n.dead) return;
+    n.hp -= amount;
+    n.pod.material.emissive.setHex(0xff3030);
+    setTimeout(() => n.pod.material.emissive.setHex(NEST_GLOW), 100);
+    if (n.hp <= 0) destroyNest(n);
+}
+
+function destroyNest(n) {
+    n.dead = true;
+    scene.remove(n.group);
+    score += 250;
+    spawnPickup('ammo', n.x + 1, n.z, { temporary: true });
+    spawnPickup('medkit', n.x - 1, n.z, { temporary: true });
+    alertHusks(n.x, n.z, 25);
+    const left = nests.filter((other) => !other.dead).length;
+    showMessage(`Bloom nest destroyed! (${nests.length - left}/${nests.length})`);
+}
+
+
+//------------------------------------------------
+// Melee Shove (F)
+// Never helpless: shove husks in front of you away, even with 0 ammo
+let meleeCooldown = 0;
+
+function shove() {
+    if (meleeCooldown > 0) return;
+    meleeCooldown = 0.7;
+
+    // jab the gun forward
+    gun.position.z -= 0.25;
+    gun.position.y += 0.05;
+
+    const forward = new THREE.Vector3();
+    camera.getWorldDirection(forward);
+    forward.y = 0;
+    forward.normalize();
+
+    let hitSomething = false;
+    for (const h of husks) {
+        if (h.dead) continue;
+        const dx = h.body.position.x - playerBody.position.x;
+        const dz = h.body.position.z - playerBody.position.z;
+        const d = Math.hypot(dx, dz) || 0.01;
+        // in range and roughly in front of us?
+        if (d > 2.6 + h.radius || (dx * forward.x + dz * forward.z) / d < 0.4) continue;
+
+        hitSomething = true;
+        const dir = new THREE.Vector3(dx / d, 0, dz / d);
+        if (h.t.heavy) {
+            // brutes barely budge, but it does interrupt a charge
+            h.stun = 0.4;
+            flashRed(h.mesh);
+        } else {
+            damageHusk(h, 1, dir);
+            if (!h.dead) {
+                h.stun = 1;
+                h.body.velocity.set(dir.x * 10, 0, dir.z * 10);
+            }
+        }
+    }
+    if (hitSomething) hitMarker();
+}
+
+
+//------------------------------------------------
+// Evac Route
+// After the signal goes out, the chopper lands at an LZ south of the tower.
+// A walled-in road leads there with wrecks, wire, fire, a barricade and ambushes.
+const LZ_POS = new THREE.Vector3(0, 0, -138);
+const LAND_TIME = 45; // seconds the player must hold the LZ
+const LZ_SPAWNS = [[-13, -153], [13, -153], [-13, -124], [13, -124], [0, -153]];
+
+// Straight rubble/concrete wall from (x1,z1) to (x2,z2). Must be along the x or z axis.
+function buildWall(x1, z1, x2, z2) {
+    const alongX = Math.abs(x2 - x1) > Math.abs(z2 - z1);
+    const len = alongX ? Math.abs(x2 - x1) : Math.abs(z2 - z1);
+    const cx = (x1 + x2) / 2;
+    const cz = (z1 + z2) / 2;
+    const g = new THREE.Group();
+
+    const slabs = Math.max(1, Math.round(len / 2));
+    const COLORS = [0x7a7064, 0x6e655a, 0x857a6b];
+    for (let i = 0; i < slabs; i++) {
+        const offset = ((i + 0.5) / slabs - 0.5) * len;
+        const h = 2.4 + Math.random() * 0.9;
+        const jitter = (Math.random() - 0.5) * 0.15;
+        const w = len / slabs + 0.05;
+        part(g, alongX ? w : 0.6, h, alongX ? 0.6 : w,
+            alongX ? offset : jitter, h / 2, alongX ? jitter : offset,
+            COLORS[i % 3], 0, 0, (Math.random() - 0.5) * 0.06);
+
+        // rubble piled at the base now and then
+        if (Math.random() < 0.3) {
+            part(g, 0.7, 0.45, 0.7, alongX ? offset : 0.7, 0.2, alongX ? 0.7 : offset,
+                0x6e5a48, 0.3, Math.random(), 0.2);
+        }
+    }
+
+    finishBuilding(g, cx, cz);
+    addStaticCollider(alongX ? len : 0.6, 3.3, alongX ? 0.6 : len, cx, cz);
+}
+
+// Wrecked car, built out of boxes like the bus. Length runs along x before rotating.
+function buildCar(x, z, rotY = 0, color = 0x6a5a4a, burnt = false) {
+    const g = new THREE.Group();
+    const BODY = burnt ? 0x2e2a26 : color;
+    const DARK = 0x2a2724;
+    const GLASS = 0x3e4a48;
+    const RUST = 0x75452f;
+
+    part(g, 4.2, 0.8, 1.9, 0, 0.7, 0, BODY);               // lower body
+    part(g, 2.2, 0.7, 1.7, -0.2, 1.45, 0, BODY);           // cabin
+    part(g, 0.06, 0.6, 1.6, 0.95, 1.4, 0, GLASS, 0, 0, -0.5); // windshield
+    for (const sx of [-1.3, 1.3]) {
+        for (const sz of [-0.95, 0.95]) part(g, 0.7, 0.7, 0.3, sx, 0.35, sz, DARK); // wheels
+    }
+    part(g, 0.9, 0.3, 0.02, 0.8, 0.75, 0.96, RUST);
+    part(g, 0.6, 0.25, 0.02, -1.2, 0.6, -0.96, RUST);
+    part(g, 1.2, 0.05, 1.0, 1.4, 1.12, 0.1, BODY, 0, 0.2, 0.3); // hood popped open
+
+    g.rotation.y = rotY;
+    finishBuilding(g, x, z);
+    addStaticCollider(4.3, 1.8, 2.0, x, z, rotY);
+}
+
+// Hazard zones: rectangles the player gets hurt/slowed in
+const hazards = [];
+const fires = [];
+
+function buildWire(z, x1, x2) {
+    const g = new THREE.Group();
+    for (let x = x1; x <= x2; x += 2) {
+        part(g, 0.1, 1.1, 0.1, x, 0.55, (Math.random() - 0.5) * 0.4, 0x4a3f35,
+            (Math.random() - 0.5) * 0.1, 0, (Math.random() - 0.5) * 0.15);
+    }
+    for (const y of [0.3, 0.6, 0.9]) {
+        for (const dz of [-0.5, 0, 0.5]) {
+            part(g, x2 - x1, 0.025, 0.025, (x1 + x2) / 2, y + Math.random() * 0.1, dz,
+                0x8a8a80, Math.random() * 0.2, 0, 0);
+        }
+    }
+    g.position.set(0, 0, z);
+    scene.add(g); // not an obstacle, bullets pass through
+    hazards.push({ type: 'wire', x1, x2, z1: z - 1.2, z2: z + 1.2, warned: false,
+        warning: 'Barbed wire! It slows you down.' });
+}
+
+function buildFire(x, z, w, d) {
+    const g = new THREE.Group();
+    const flames = [];
+    for (let i = 0; i < 14; i++) {
+        const flame = new THREE.Mesh(
+            new THREE.ConeGeometry(0.35 + Math.random() * 0.3, 1.2 + Math.random(), 6),
+            new THREE.MeshBasicMaterial({ color: i % 3 ? 0xff7a20 : 0xffc040, transparent: true, opacity: 0.85 })
+        );
+        flame.position.set((Math.random() - 0.5) * w, 0.6, (Math.random() - 0.5) * d);
+        flame.userData.phase = Math.random() * 10;
+        g.add(flame);
+        flames.push(flame);
+    }
+    const light = new THREE.PointLight(0xff7020, 8, 14);
+    light.position.y = 1.5;
+    g.add(light);
+    g.position.set(x, 0, z);
+    scene.add(g);
+
+    fires.push({ flames, light });
+    hazards.push({ type: 'fire', x1: x - w / 2, x2: x + w / 2, z1: z - d / 2, z2: z + d / 2, warned: false,
+        warning: "You're on fire! Get out!" });
+}
+
+function updateHazards(dt, time) {
+    for (const f of fires) {
+        for (const flame of f.flames) {
+            flame.scale.y = 1 + 0.35 * Math.sin(time * 12 + flame.userData.phase);
+        }
+        f.light.intensity = 6 + Math.random() * 4;
+    }
+
+    hazardSlow = 1;
+    const px = playerBody.position.x;
+    const pz = playerBody.position.z;
+    for (const zone of hazards) {
+        if (px < zone.x1 || px > zone.x2 || pz < zone.z1 || pz > zone.z2) continue;
+        if (!zone.warned) {
+            zone.warned = true;
+            showMessage(zone.warning, 2);
+        }
+        if (zone.type === 'fire') hurtPlayer(20 * dt);
+        if (zone.type === 'wire') {
+            hazardSlow = 0.4;
+            hurtPlayer(4 * dt);
+        }
+    }
+}
+
+// Flare: glowing stick on the ground marking the route (no light, cheap)
+function buildFlare(x, z) {
+    const flare = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.06, 0.06, 0.4, 6),
+        new THREE.MeshBasicMaterial({ color: 0xff3020 })
+    );
+    flare.position.set(x, 0.2, z);
+    flare.rotation.z = 0.5;
+    scene.add(flare);
+}
+
+// The barricade blocks the road until something blows it up (or you shoot it to pieces)
+let barricade = null;
+
+function spawnBarricade(z) {
+    const g = new THREE.Group();
+    for (let x = -6.3; x <= 6.4; x += 1.4) {
+        part(g, 1.3, 1.2, 1.2, x, 0.6, (Math.random() - 0.5) * 0.3, 0x6b5238, 0, Math.random() * 0.3, 0);
+        if (Math.random() < 0.7) {
+            part(g, 1.2, 1.1, 1.1, x + (Math.random() - 0.5) * 0.4, 1.75, 0, 0x7a6040, 0, Math.random() * 0.4, 0);
+        }
+    }
+    part(g, 14.5, 0.25, 0.1, 0, 1.0, 0.7, 0x594638, 0, 0, 0.04);
+    part(g, 14.5, 0.25, 0.1, 0, 2.1, 0.7, 0x594638, 0, 0, -0.05);
+    part(g, 3, 1.6, 0.06, -3, 1.4, 0.75, 0x777269, 0, 0, 0.1);
+    part(g, 2.4, 1.3, 0.06, 3.5, 1.2, 0.75, 0x75452f, 0, 0, -0.08);
+    g.position.set(0, 0, z);
+    scene.add(g);
+
+    const body = new CANNON.Body({
+        mass: 0,
+        shape: new CANNON.Box(new CANNON.Vec3(7.3, 3, 0.7)),
+        position: new CANNON.Vec3(0, 3, z),
+    });
+    world.addBody(body);
+
+    barricade = { group: g, body, hp: 30, z };
+    g.userData.barricade = barricade;
+}
+
+function damageBarricade(amount) {
+    if (!barricade) return;
+    barricade.hp -= amount;
+    if (barricade.hp <= 0) breakBarricade();
+}
+
+function breakBarricade() {
+    if (!barricade) return;
+    const { group, body, z } = barricade;
+    scene.remove(group);
+    world.removeBody(body);
+    barricade = null;
+
+    // a few crates go flying as debris
+    for (let i = 0; i < 5; i++) {
+        spawnCrate(-5 + i * 2.5, z);
+        props[props.length - 1].body.applyImpulse(
+            new CANNON.Vec3((Math.random() - 0.5) * 30, 40, -20 - Math.random() * 30)
+        );
+    }
+    showMessage('The barricade is down!', 2.5);
+
+    // the noise brings out whatever was hiding behind it
+    spawnGroup([['normal', -3, z - 8], ['normal', 3, z - 9], ['runner', 0, z - 12], ['runner', -5, z - 14]]);
+}
+
+// Ambush triggers: fire once when the player walks south past a z line on the road
+const triggers = [];
+
+function setupTriggers() {
+    triggers.length = 0;
+    triggers.push(
+        { z: -70, run: () => spawnGroup([['runner', -3, -86], ['runner', 3, -88], ['runner', 0, -90]]) },
+        { z: -90, run: () => { if (barricade) showMessage('A barricade blocks the road. Those barrels look useful...', 4); } },
+        { z: -101, run: () => spawnGroup([['brute', 0, -118], ['normal', 3, -119], ['normal', -2, -121]]) },
+    );
+    for (const t of triggers) t.fired = false;
+}
+
+function updateTriggers() {
+    const px = playerBody.position.x;
+    const pz = playerBody.position.z;
+    if (Math.abs(px) > 8) return; // only on the road
+    for (const t of triggers) {
+        if (!t.fired && pz < t.z) {
+            t.fired = true;
+            t.run();
+        }
+    }
+}
+
+// Evac chopper, built from boxes. Circles the LZ after the signal, then lands.
+let chopper;
+let rotor;
+
+function buildChopper() {
+    const g = new THREE.Group();
+    const BODY = 0x4a5240;
+    const DARK = 0x23241f;
+    const GLASS = 0x3e4a48;
+
+    part(g, 2.2, 1.8, 4.2, 0, 1.6, 0, BODY);       // cabin
+    part(g, 1.9, 1.0, 1.0, 0, 1.9, -2.4, GLASS);   // nose window
+    part(g, 0.5, 0.5, 5, 0, 2.1, 4.4, BODY);       // tail boom
+    part(g, 0.15, 1.5, 0.9, 0, 2.8, 6.7, BODY);    // tail fin
+    part(g, 0.2, 0.4, 0.2, 0, 2.6, 0, DARK);       // rotor mast
+    for (const sx of [-1, 1]) {
+        part(g, 0.12, 0.12, 4.2, sx, 0.1, 0, DARK); // skids
+        for (const sz of [-1.2, 1.2]) part(g, 0.1, 0.6, 0.1, sx, 0.4, sz, DARK);
+    }
+
+    rotor = new THREE.Group();
+    part(rotor, 9, 0.08, 0.35, 0, 0, 0, DARK);
+    part(rotor, 0.35, 0.08, 9, 0, 0, 0, DARK);
+    rotor.position.y = 2.8;
+    g.add(rotor);
+
+    g.visible = false;
+    scene.add(g);
+    chopper = g;
+}
+
+function buildEvacRoute() {
+    // Road walls from the tower down to the LZ
+    buildWall(-7.3, -60, -7.3, -120);
+    buildWall(7.3, -60, 7.3, -120);
+
+    // LZ enclosure, only open where the road comes in
+    buildWall(-16, -120, -16, -156);
+    buildWall(16, -120, 16, -156);
+    buildWall(-16, -156, 16, -156);
+    buildWall(-16, -120, -7.3, -120);
+    buildWall(7.3, -120, 16, -120);
+
+    // Wrecks you have to weave around
+    buildCar(-4, -67, 0.1, 0x5a6a70);
+    buildCar(-1.8, -70, -0.35, 0x7a4a3a);
+    buildCar(4, -84, -0.15, 0x6a5a4a, true);
+    buildCar(-4, -116, 0.1, 0x55604a);
+
+    // Hazards
+    buildWire(-76, -7, 7);
+    buildCar(4, -109, 0.3, 0, true); // the burning one
+    buildFire(3.8, -109, 6.4, 6);
+
+    // Supply cache halfway: tarp over two posts
+    part(scene, 0.15, 2.4, 0.15, -6.5, 1.2, -88, 0x594638);
+    part(scene, 0.15, 2.4, 0.15, -6.5, 1.2, -92, 0x594638);
+    part(scene, 2.2, 0.06, 4.6, -5.6, 2.3, -90, 0x5a6a50, 0, 0, -0.15);
+
+    // Flares marking the way
+    for (let z = -62; z >= -118; z -= 12) {
+        buildFlare(-6, z);
+        buildFlare(6, z - 6);
+    }
+
+    // Helipad: concrete square with an "H"
+    const PAD = 0x8a8478;
+    const MARK = 0xd8c88a;
+    part(scene, 10, 0.06, 10, LZ_POS.x, 0.03, LZ_POS.z, PAD);
+    part(scene, 0.6, 0.07, 5, LZ_POS.x - 1.6, 0.04, LZ_POS.z, MARK);
+    part(scene, 0.6, 0.07, 5, LZ_POS.x + 1.6, 0.04, LZ_POS.z, MARK);
+    part(scene, 2.6, 0.07, 0.6, LZ_POS.x, 0.04, LZ_POS.z, MARK);
+    for (const [fx, fz] of [[-5, -5], [5, -5], [-5, 5], [5, 5]]) buildFlare(LZ_POS.x + fx, LZ_POS.z + fz);
+
+    // Green smoke column so you can spot the LZ from the tower
+    const smoke = new THREE.Mesh(
+        new THREE.CylinderGeometry(1.2, 2, 30, 10, 1, true),
+        new THREE.MeshBasicMaterial({ color: 0x66ff66, transparent: true, opacity: 0.18, depthWrite: false })
+    );
+    smoke.position.set(LZ_POS.x + 6, 15, LZ_POS.z - 6);
+    scene.add(smoke);
+
+    buildChopper();
+}
+
+//------------------------------------------------
+// OUTSKIRTS: five new locations + the journal pages that tell the Bloom's story
+// Story order (players can find them in any order):
+//   Farm (Day 1) -> Checkpoint bulletin -> Diner (Day 96) -> Chapel (Day 150)
+//   -> Crashed EVAC-2 recorder -> your existing house note (Day 212)
+ 
+// Small paper note, same look as the one in the collapsed house
+function notePaper(g, y = 0.01) {
+    part(g, 0.3, 0.002, 0.4, 0, y, 0, 0xe8e0c8, 0, 0.4, 0);
+    part(g, 0.2, 0.025, 0.03, 0, y + 0.002, -0.05, 0x333333, 0, 0.3, 0);
+    part(g, 0.2, 0.025, 0.03, 0, y + 0.002, 0.05, 0x333333, 0, 0.4, 0);
+}
+ 
+ 
+// MILITARY QUARANTINE CHECKPOINT
+// Two tents, a sandbag wall with a gate, fence, floodlight and an abandoned jeep
+function buildCheckpoint(x, z) {
+    const g = new THREE.Group();
+    const OLIVE = 0x4f5536;
+    const CANVAS = 0x6b6a4a;
+    const SAND = 0x8f7f5c;
+    const DARK = 0x2f312a;
+    const METAL = 0x6d6a60;
+    const RED = 0x8a3a2a;
+    const WHITE = 0xcfc8b0;
+ 
+    // Two army tents: canvas body, peaked roof, open flap facing the camp
+    for (const tx of [-5, 5]) {
+        part(g, 5, 2.2, 4, tx, 1.1, -4, CANVAS);
+        part(g, 5.2, 0.12, 2.4, tx, 2.6, -5, OLIVE, -0.5, 0, 0);
+        part(g, 5.2, 0.12, 2.4, tx, 2.6, -3, OLIVE, 0.5, 0, 0);
+        part(g, 1.2, 1.8, 0.05, tx, 0.9, -1.97, DARK);
+    }
+ 
+    // Field desk between the tents, with a dead radio on it
+    part(g, 1.6, 0.08, 0.9, 0, 0.75, -4, OLIVE);
+    for (const [lx, lz] of [[-0.7, -0.4], [0.7, -0.4], [-0.7, 0.4], [0.7, 0.4]]) {
+        part(g, 0.06, 0.75, 0.06, lx, 0.37, -4 + lz, DARK);
+    }
+    part(g, 0.4, 0.25, 0.3, 0.5, 0.92, -4.2, DARK);
+ 
+    // Sandbag wall with a gap in the middle for the gate
+    for (let sx = -9; sx <= 9; sx += 0.9) {
+        if (Math.abs(sx) < 2) continue;
+        for (let row = 0; row < 3; row++) {
+            part(g, 0.85, 0.35, 0.5, sx + (row % 2) * 0.4, 0.18 + row * 0.33, 3.5, SAND,
+                0, (Math.random() - 0.5) * 0.1, 0);
+        }
+    }
+ 
+    // Gate: post and a red/white boom arm, snapped and hanging
+    part(g, 0.3, 1.2, 0.3, 2.3, 0.6, 3.5, METAL);
+    for (let i = 0; i < 4; i++) {
+        part(g, 1, 0.15, 0.15, 1.8 - i, 1.15 - i * 0.15, 3.5, i % 2 ? RED : WHITE, 0, 0, 0.15);
+    }
+ 
+    // Fence along the back
+    for (let fx = -10; fx <= 10; fx += 2.5) part(g, 0.12, 2.2, 0.12, fx, 1.1, -8, METAL);
+    for (const y of [0.4, 1.2, 2.0]) part(g, 20, 0.04, 0.04, 0, y, -8, METAL);
+    part(g, 6, 1.8, 0.03, -6, 1.1, -8, 0x5a5a52, 0, 0, 0.05); // sagging fence panel
+ 
+    // Quarantine sign
+    part(g, 0.15, 3, 0.15, -9, 1.5, 4.5, METAL);
+    part(g, 2.2, 1.2, 0.08, -9, 2.6, 4.55, WHITE);
+    part(g, 2.0, 0.25, 0.09, -9, 2.95, 4.58, RED);
+ 
+    // Floodlight tower and supply crates
+    part(g, 0.2, 5, 0.2, 9, 2.5, -6, METAL);
+    part(g, 1.4, 0.6, 0.4, 9, 5.1, -6, DARK, 0.3, 0, 0);
+    part(g, 1, 1, 1, 8, 0.5, -1, OLIVE);
+    part(g, 1, 1, 1, 8.2, 1.5, -1.1, OLIVE, 0, 0.3, 0);
+    part(g, 1, 0.6, 0.8, 9.2, 0.3, -0.5, OLIVE, 0, 0.2, 0);
+ 
+    finishBuilding(g, x, z);
+    buildCar(x + 7, z + 6, 0.4, OLIVE); // abandoned army jeep (has its own collider)
+ 
+    // Colliders: tents, both halves of the sandbag wall, fence, crates
+    addStaticCollider(5, 2.2, 4, x - 5, z - 4);
+    addStaticCollider(5, 2.2, 4, x + 5, z - 4);
+    addStaticCollider(7.6, 1.1, 0.6, x - 5.6, z + 3.5);
+    addStaticCollider(7.6, 1.1, 0.6, x + 6.0, z + 3.5);
+    addStaticCollider(20, 2.2, 0.2, x, z - 8);
+    addStaticCollider(2, 2, 1.2, x + 8.5, z - 1);
+}
+ 
+ 
+// ROADSIDE DINER
+// Long building with the door on the west side, counter and booths inside,
+// tall sign and a parking lot out front
+function buildDiner(x, z) {
+    const g = new THREE.Group();
+    const WALL = 0xa8a090;
+    const TRIM = 0x8a3a2a;
+    const ROOF = 0x4a4540;
+    const GLASS = 0x52605c;
+    const CHROME = 0x9a968c;
+    const COUNTER = 0x7a5a40;
+    const SEAT = 0x7a2a2a;
+    const CONCRETE = 0x777064;
+ 
+    // Walls: door gap in the west wall
+    part(g, 0.35, 3.4, 7, 6, 1.7, 0, WALL);          // back (east)
+    part(g, 12, 3.4, 0.35, 0, 1.7, -3.5, WALL);      // north
+    part(g, 12, 1.1, 0.35, 0, 0.55, 3.5, WALL);      // south, below the windows
+    part(g, 12, 0.7, 0.35, 0, 3.05, 3.5, WALL);      // south, above the windows
+    part(g, 0.35, 3.4, 2.5, -6, 1.7, -2.25, WALL);   // west, left of the door
+    part(g, 0.35, 3.4, 2.5, -6, 1.7, 2.25, WALL);    // west, right of the door
+    part(g, 0.35, 0.8, 2.0, -6, 3.0, 0, WALL);       // over the door
+ 
+    // Big front windows: two intact, one shattered, one missing
+    for (const mx of [-3, 0, 3]) part(g, 0.15, 1.6, 0.4, mx, 1.9, 3.5, CHROME);
+    part(g, 2.8, 1.5, 0.06, -4.5, 1.9, 3.5, GLASS);
+    part(g, 2.8, 1.5, 0.06, 1.5, 1.9, 3.5, GLASS);
+    part(g, 1.2, 0.7, 0.06, -1.9, 1.5, 3.5, GLASS, 0, 0, 0.4);
+ 
+    // Red trim stripes and flat roof
+    part(g, 12.1, 0.2, 0.05, 0, 1.0, 3.7, TRIM);
+    part(g, 12.1, 0.2, 0.05, 0, 1.0, -3.7, TRIM);
+    part(g, 12.8, 0.3, 7.8, 0, 3.55, 0, ROOF);
+    part(g, 12.8, 0.4, 0.1, 0, 3.4, 3.95, TRIM);
+ 
+    // Counter with a chrome top and a row of stools (one knocked over)
+    part(g, 7, 1.0, 0.8, 1, 0.5, -2.4, COUNTER);
+    part(g, 7.2, 0.08, 1.0, 1, 1.04, -2.4, CHROME);
+    for (let sx = -1.5; sx <= 3.5; sx += 1.25) {
+        if (Math.abs(sx - 1) < 0.1) continue;
+        part(g, 0.12, 0.7, 0.12, sx, 0.35, -1.5, CHROME);
+        part(g, 0.45, 0.1, 0.45, sx, 0.72, -1.5, SEAT);
+    }
+    part(g, 0.45, 0.1, 0.45, 1.2, 0.22, -0.8, SEAT, 1.4, 0.3, 0);
+    part(g, 0.12, 0.7, 0.12, 1.0, 0.1, -0.5, CHROME, 1.5, 0.3, 0);
+ 
+    // Booths along the window wall
+    for (const bx of [-4, -1, 2]) {
+        part(g, 1.2, 0.08, 0.8, bx, 0.75, 2.6, COUNTER);
+        part(g, 0.1, 0.75, 0.1, bx, 0.37, 2.6, CHROME);
+        for (const side of [-1, 1]) {
+            part(g, 0.5, 0.5, 0.8, bx + side * 0.95, 0.25, 2.6, SEAT);
+            part(g, 0.15, 1.0, 0.8, bx + side * 1.2, 0.75, 2.6, SEAT);
+        }
+    }
+ 
+    // Tall roadside sign, leaning a little
+    part(g, 0.3, 6, 0.3, -8, 3, -4, CHROME);
+    part(g, 3.2, 1.4, 0.25, -8, 6.4, -4, TRIM, 0, 0, 0.08);
+    part(g, 2.6, 0.4, 0.27, -8, 6.4, -4, 0xd8d0b8, 0, 0, 0.08);
+ 
+    // Parking lot with faded lines
+    part(g, 9, 0.04, 9, -11, 0.02, 0, CONCRETE);
+    for (const lz of [-3, 0, 3]) part(g, 3, 0.05, 0.12, -12.5, 0.03, lz, 0xc8c0a0);
+ 
+    finishBuilding(g, x, z);
+    buildCar(x - 11, z + 1.5, 0.1, 0x7a3a3a);
+    buildCar(x - 12, z - 3.5, -0.2, 0x5a6a70, true);
+ 
+    // Colliders: walls (door left open) and the counter
+    addStaticCollider(0.35, 3.4, 7, x + 6, z);
+    addStaticCollider(12, 3.4, 0.35, x, z - 3.5);
+    addStaticCollider(12, 3.4, 0.35, x, z + 3.5);
+    addStaticCollider(0.35, 3.4, 2.5, x - 6, z - 2.25);
+    addStaticCollider(0.35, 3.4, 2.5, x - 6, z + 2.25);
+    addStaticCollider(7, 1.0, 0.8, x + 1, z - 2.4);
+}
+ 
+ 
+// FARM: where the Bloom started
+// Farmhouse with a porch, a silo, a rusty tractor and a field of glowing Bloom crops
+ 
+// Shared by every crop stalk so 40+ stalks don't each make their own material
+const BLOOM_STALK_MAT = new THREE.MeshStandardMaterial({ color: 0x3f5a2a });
+const BLOOM_BULB_MAT = new THREE.MeshStandardMaterial({ color: 0x66ff44, emissive: 0x66ff44, emissiveIntensity: 0.8 });
+const STALK_GEO = new THREE.BoxGeometry(0.08, 1.6, 0.08);
+const BULB_GEO = new THREE.BoxGeometry(0.22, 0.3, 0.22);
+ 
+function buildFarm(x, z) {
+    const g = new THREE.Group();
+    const WALL = 0xb8a888;
+    const WOOD = 0x594638;
+    const ROOF = 0x5a3a2e;
+    const DARK = 0x2f2c28;
+    const GLASS = 0x52605c;
+    const SILO = 0x8a8478;
+    const RUST = 0x75452f;
+    const DIRT = 0x5e4632;
+ 
+    // Farmhouse walls: door in the east wall, facing the porch
+    part(g, 0.3, 3.4, 7, -4, 1.7, 0, WALL);
+    part(g, 8, 3.4, 0.3, 0, 1.7, -3.5, WALL);
+    part(g, 8, 3.4, 0.3, 0, 1.7, 3.5, WALL);
+    part(g, 0.3, 3.4, 2.5, 4, 1.7, -2.25, WALL);
+    part(g, 0.3, 3.4, 2.5, 4, 1.7, 2.25, WALL);
+    part(g, 0.3, 0.8, 2.0, 4, 3.0, 0, WALL);
+ 
+    // Boarded-up front windows
+    for (const wz of [-2.25, 2.25]) {
+        part(g, 0.05, 1.0, 1.2, 4.17, 1.9, wz, GLASS);
+        part(g, 0.06, 0.15, 1.4, 4.2, 1.7, wz, WOOD, 0.3, 0, 0);
+        part(g, 0.06, 0.15, 1.4, 4.2, 2.1, wz, WOOD, -0.25, 0, 0);
+    }
+ 
+    // Pitched roof (ridge runs north-south) and stepped gable ends
+    part(g, 4.6, 0.25, 8, -2.1, 4.2, 0, ROOF, 0, 0, 0.45);
+    part(g, 4.6, 0.25, 8, 2.1, 4.2, 0, ROOF, 0, 0, -0.45);
+    for (const gz of [-3.5, 3.5]) {
+        part(g, 5, 0.6, 0.3, 0, 3.7, gz, WALL);
+        part(g, 2.4, 0.6, 0.3, 0, 4.3, gz, WALL);
+        part(g, 0.5, 0.45, 0.3, 0, 4.8, gz, WALL);
+    }
+ 
+    // Porch
+    part(g, 2.5, 0.2, 7, 5.3, 0.1, 0, WOOD);
+    for (const pz of [-3.3, 3.3]) part(g, 0.15, 2.9, 0.15, 6.4, 1.5, pz, WOOD);
+    part(g, 2.8, 0.15, 7.4, 5.4, 3.05, 0, ROOF, 0, 0, -0.12);
+    part(g, 0.6, 0.6, 0.6, 5.8, 0.5, -2.5, WOOD, 0, 0.4, 0);
+ 
+    // Silo with a rusty dome and a ladder
+    const silo = new THREE.Mesh(
+        new THREE.CylinderGeometry(2.2, 2.2, 10, 10),
+        new THREE.MeshStandardMaterial({ color: SILO })
+    );
+    silo.position.set(10, 5, -7);
+    silo.castShadow = true;
+    silo.receiveShadow = true;
+    g.add(silo);
+    const cap = new THREE.Mesh(
+        new THREE.SphereGeometry(2.2, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2),
+        new THREE.MeshStandardMaterial({ color: RUST })
+    );
+    cap.position.set(10, 10, -7);
+    cap.castShadow = true;
+    g.add(cap);
+    part(g, 0.1, 9, 0.5, 12.25, 4.5, -7, DARK);
+ 
+    // Old tractor
+    part(g, 2.4, 1.0, 1.2, 7, 1.1, 7, RUST);
+    part(g, 0.9, 1.0, 1.1, 6.2, 2.0, 7, RUST);
+    for (const wz of [6.2, 7.8]) {
+        part(g, 1.4, 1.4, 0.35, 6.2, 0.7, wz, DARK);
+        part(g, 0.8, 0.8, 0.3, 7.9, 0.4, wz, DARK);
+    }
+    part(g, 0.12, 0.9, 0.12, 7.8, 2.0, 7, DARK);
+ 
+    // The Bloom field: dirt patch full of glowing stalks, with a clearing for the nest
+    part(g, 9.5, 0.03, 13, -11.75, 0.015, 0, DIRT);
+    for (let fx = -15.5; fx <= -7.5; fx += 1.6) {
+        for (let fz = -5.5; fz <= 5.5; fz += 1.4) {
+            if (Math.hypot(fx + 11, fz) < 2.5) continue;
+            const sx = fx + (Math.random() - 0.5) * 0.4;
+            const sz = fz + (Math.random() - 0.5) * 0.4;
+            const h = 0.8 + Math.random() * 0.6;
+ 
+            const stalk = new THREE.Mesh(STALK_GEO, BLOOM_STALK_MAT);
+            stalk.scale.y = h;
+            stalk.position.set(sx, 0.8 * h, sz);
+            stalk.rotation.set((Math.random() - 0.5) * 0.3, 0, (Math.random() - 0.5) * 0.3);
+            g.add(stalk);
+ 
+            const bulb = new THREE.Mesh(BULB_GEO, BLOOM_BULB_MAT);
+            bulb.position.set(sx, 1.6 * h, sz);
+            g.add(bulb);
+        }
+    }
+ 
+    // Wooden fence along both sides of the field
+    for (const fz of [-6.8, 6.8]) {
+        for (let fx = -16; fx <= -7; fx += 2) part(g, 0.12, 1.1, 0.12, fx, 0.55, fz, WOOD);
+        part(g, 9, 0.1, 0.06, -11.5, 0.8, fz, WOOD, 0, 0, fz > 0 ? 0.06 : -0.04);
+    }
+ 
+    finishBuilding(g, x, z);
+ 
+    // Colliders: house walls (door open), silo, tractor
+    addStaticCollider(0.3, 3.4, 7, x - 4, z);
+    addStaticCollider(8, 3.4, 0.3, x, z - 3.5);
+    addStaticCollider(8, 3.4, 0.3, x, z + 3.5);
+    addStaticCollider(0.3, 3.4, 2.5, x + 4, z - 2.25);
+    addStaticCollider(0.3, 3.4, 2.5, x + 4, z + 2.25);
+    addStaticCollider(4.4, 10, 4.4, x + 10, z - 7);
+    addStaticCollider(2.4, 2.4, 1.6, x + 7, z + 7);
+}
+ 
+ 
+// CRASHED EVAC-2 CHOPPER
+// The first rescue attempt: cabin rolled on its side, tail torn off, rotor blades everywhere
+function buildCrashedChopper(x, z, rotY = 0.5) {
+    const g = new THREE.Group();
+    const BODY = 0x3e4436;
+    const DARK = 0x23241f;
+    const BURNT = 0x2a2622;
+    const GLASS = 0x3e4a48;
+    const SCORCH = 0x3a2e24;
+ 
+    // Scorched ground
+    part(g, 13, 0.02, 10, 0, 0.012, 1, SCORCH);
+ 
+    // Cabin rolled onto its side, with a skid sticking up
+    part(g, 2.2, 1.8, 4.2, 0, 1.3, 0, BODY, 0, 0, 1.2);
+    part(g, 1.9, 1.0, 1.0, -0.2, 1.2, -2.5, GLASS, 0, 0, 1.2);
+    part(g, 1.4, 1.2, 0.06, 0.6, 1.1, 2.12, BURNT, 0, 0, 1.2);
+    part(g, 0.12, 0.12, 4.2, 1.76, 1.69, 0, DARK, 0, 0, 1.2);
+    part(g, 0.12, 0.12, 3, 2.6, 0.1, -1, DARK, 0, 0.4, 0);
+ 
+    // Tail boom torn off and lying a few meters away
+    part(g, 0.5, 0.5, 4.5, 2.8, 0.3, 5.5, BODY, 0, 0.5, 0);
+    part(g, 0.15, 1.5, 0.9, 3.8, 0.9, 7.3, BODY, 0, 0.5, 0.25);
+ 
+    // Rotor blades: two flung across the ground, one stabbed into the dirt
+    part(g, 4.5, 0.08, 0.35, -4.5, 0.05, 2.5, DARK, 0, 0.8, 0);
+    part(g, 4, 0.08, 0.35, 3.5, 0.05, -4.5, DARK, 0, -0.4, 0.04);
+    part(g, 0.35, 3.2, 0.08, -2.8, 1.3, -4.2, DARK, 0.3, 0, 0.25);
+ 
+    // Debris
+    part(g, 0.8, 0.3, 0.6, -3, 0.15, 4, BURNT, 0.2, 0.5, 0.1);
+    part(g, 1.2, 0.2, 0.9, 4.5, 0.1, 1, BURNT, 0, 1.1, 0.1);
+    part(g, 0.5, 0.5, 0.5, -1, 0.25, 4.5, BODY, 0.3, 0.2, 0.2);
+ 
+    g.rotation.y = rotY;
+    finishBuilding(g, x, z);
+    addStaticCollider(4.4, 2.6, 4.6, x, z, rotY); // cabin only, the rest you can walk over
+ 
+    // Thin smoke column (added to the scene, not the building, so bullets pass through it)
+    const smoke = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.8, 1.6, 16, 8, 1, true),
+        new THREE.MeshBasicMaterial({ color: 0x4a4540, transparent: true, opacity: 0.12, depthWrite: false })
+    );
+    smoke.position.set(x, 8, z);
+    scene.add(smoke);
+}
+ 
+ 
+// CHAPEL AND GRAVEYARD
+// Stone chapel with a steeple and stained glass, pews inside, graves out the east side
+function buildChapel(x, z) {
+    const g = new THREE.Group();
+    const STONE = 0x8a8274;
+    const DARK_STONE = 0x6e675c;
+    const ROOF = 0x3f3a36;
+    const WOOD = 0x594638;
+    const STAINED = [0x8a3a3a, 0x3a4a7a, 0xa08a3a];
+ 
+    // Walls: 6 wide, 10 long, door in the north wall facing town
+    part(g, 0.4, 3.8, 10, -3, 1.9, 0, STONE);
+    part(g, 0.4, 3.8, 10, 3, 1.9, 0, STONE);
+    part(g, 6.4, 3.8, 0.4, 0, 1.9, -5, STONE);
+    part(g, 2.2, 3.8, 0.4, -1.9, 1.9, 5, STONE);
+    part(g, 2.2, 3.8, 0.4, 1.9, 1.9, 5, STONE);
+    part(g, 1.6, 1.0, 0.4, 0, 3.3, 5, STONE);
+ 
+    // Stained glass: three windows per side, and a 4-pane window behind the altar
+    for (const side of [-1, 1]) {
+        [-3, 0, 3].forEach((wz, i) => {
+            part(g, 0.06, 1.6, 0.9, side * 3.22, 2.2, wz, STAINED[(i + (side > 0 ? 1 : 0)) % 3]);
+        });
+    }
+    [[-0.4, 2.0], [0.4, 2.0], [-0.4, 2.8], [0.4, 2.8]].forEach(([wx, wy], i) => {
+        part(g, 0.75, 0.75, 0.06, wx, wy, -5.22, STAINED[i % 3]);
+    });
+ 
+    // Pitched roof and gable ends
+    part(g, 3.8, 0.25, 10.8, -1.6, 4.6, 0, ROOF, 0, 0, 0.5);
+    part(g, 3.8, 0.25, 10.8, 1.6, 4.6, 0, ROOF, 0, 0, -0.5);
+    for (const gz of [-5, 5]) {
+        part(g, 3.9, 0.6, 0.4, 0, 4.1, gz, STONE);
+        part(g, 1.7, 0.6, 0.4, 0, 4.7, gz, STONE);
+    }
+ 
+    // Steeple over the door, with a spire and a crooked cross
+    part(g, 2, 3.6, 2, 0, 5.6, 4.6, STONE);
+    part(g, 0.8, 1.0, 0.05, 0, 6.4, 5.62, 0x1e1c1a); // belfry opening
+    const spire = new THREE.Mesh(
+        new THREE.ConeGeometry(1.5, 3.5, 4),
+        new THREE.MeshStandardMaterial({ color: ROOF })
+    );
+    spire.position.set(0, 9.15, 4.6);
+    spire.rotation.y = Math.PI / 4;
+    spire.castShadow = true;
+    g.add(spire);
+    part(g, 0.12, 1.0, 0.12, 0, 11.4, 4.6, WOOD, 0, 0, 0.3);
+    part(g, 0.6, 0.12, 0.12, 0.08, 11.6, 4.6, WOOD, 0, 0, 0.3);
+ 
+    // Pews on both sides of the aisle (a few knocked over) and the altar
+    for (let pz = 3; pz >= -2.5; pz -= 1.3) {
+        for (const side of [-1, 1]) {
+            const knocked = Math.random() < 0.25;
+            part(g, 2, 0.45, 0.4, side * 1.6, knocked ? 0.2 : 0.45, pz, WOOD, knocked ? 1.3 : 0, 0, 0);
+            if (!knocked) part(g, 2, 0.6, 0.1, side * 1.6, 0.8, pz - 0.2, WOOD);
+        }
+    }
+    part(g, 2, 1, 0.8, 0, 0.5, -4.2, DARK_STONE);
+ 
+    // Graveyard to the east: rows of leaning headstones with dirt mounds
+    for (let gx = 6.5; gx <= 12.5; gx += 2) {
+        for (let gz = -0.5; gz <= 7.5; gz += 2.5) {
+            const tilt = (Math.random() - 0.5) * 0.25;
+            part(g, 0.7, 0.9 + Math.random() * 0.3, 0.15, gx, 0.45, gz, DARK_STONE, tilt, 0, tilt * 0.5);
+            part(g, 0.7, 0.05, 1.4, gx, 0.03, gz + 0.8, 0x4a3a2c);
+        }
+    }
+    // A freshly dug grave with a shovel left in the dirt pile
+    part(g, 0.9, 0.02, 1.8, 6.5, 0.01, -3, 0x2a2018);
+    part(g, 0.9, 0.4, 0.9, 7.6, 0.2, -3, 0x5e4632, 0, 0.4, 0);
+    part(g, 0.06, 1.3, 0.06, 7.3, 0.6, -2.4, WOOD, 0.4, 0, 0.2);
+ 
+    // Low fence around the graveyard (no collider, you can walk through gaps)
+    for (const fz of [-4.5, 9]) {
+        for (let fx = 5.5; fx <= 13.5; fx += 1.5) part(g, 0.1, 0.8, 0.1, fx, 0.4, fz, WOOD);
+        part(g, 8, 0.08, 0.05, 9.5, 0.6, fz, WOOD);
+    }
+ 
+    finishBuilding(g, x, z);
+ 
+    // Colliders: walls (door open) and the altar
+    addStaticCollider(0.4, 3.8, 10, x - 3, z);
+    addStaticCollider(0.4, 3.8, 10, x + 3, z);
+    addStaticCollider(6.4, 3.8, 0.4, x, z - 5);
+    addStaticCollider(2.2, 3.8, 0.4, x - 1.9, z + 5);
+    addStaticCollider(2.2, 3.8, 0.4, x + 1.9, z + 5);
+    addStaticCollider(2, 1, 0.8, x, z - 4.2);
+}
+ 
+ 
+// LORE: journal pages and records at each new location.
+// They use addSecret, so they count toward the secrets total and give +50 score.
+function buildLoreNotes() {
+    // Farm porch
+    addSecret(-54.5, 43.5, (g) => notePaper(g, 0.21),
+        'Torn journal page: "Day 1. The corn came up overnight with green veins in every stalk. At night the whole field glows. Dad thinks it\'s beautiful."');
+ 
+    // Checkpoint field desk
+    addSecret(-55, -34, (g) => notePaper(g, 0.8),
+        'Military bulletin: "SECTOR 9 QUARANTINE. The Bloom spreads by spore. Infected hosts are hostile. Evacuation flights suspended until further notice."');
+ 
+    // Diner floor, near the counter
+    addSecret(52, 14.2, (g) => notePaper(g),
+        'Journal page: "Day 96. Marcus found us at the diner. Six of us now. He says Tower 9 can still reach the evac channel if we find the parts."');
+ 
+    // Chapel altar
+    addSecret(-28, -76.2, (g) => notePaper(g, 1.01),
+        'Journal page: "Day 150. We buried Ellie behind the chapel. Marcus has started coughing. It comes up green."');
+ 
+    // Flight recorder near the crashed chopper
+    addSecret(45, -57, (g) => {
+        part(g, 0.4, 0.3, 0.5, 0, 0.15, 0, 0xd0661a, 0, 0.5, 0);
+        part(g, 0.42, 0.06, 0.52, 0, 0.22, 0, 0x222222, 0, 0.5, 0);
+    }, 'Flight recorder: "EVAC-2 to base... spore cloud in the intake... losing power... we\'re going dow—" The recording ends.');
+}
+ 
+ 
+// Husks, nests and supplies at the new locations. Called from spawnEntities()
+// so they come back when the player presses R.
+function spawnOutskirts() {
+    // Checkpoint: the soldiers who didn't make it
+    spawnCluster(-55, -25, [['normal', -58, -22], ['normal', -52, -23], ['runner', -55, -18]]);
+    spawnBarrel(-63, -24);
+    spawnBarrel(-62.2, -23.5);
+    spawnPickup('ammo', -55, -36);
+    spawnPickup('ammo', -53.5, -36);
+ 
+    // Diner: nest in the back booth area, guards in the parking lot
+    spawnNest(59, 15);
+    spawnCluster(46, 15, [['normal', 45, 12], ['normal', 47, 18], ['runner', 42, 15], ['normal', 50, 10]]);
+    spawnPickup('medkit', 54, 16);
+ 
+    // Farm: the very first nest, right in the middle of the field
+    spawnNest(-71, 45);
+    spawnCluster(-62, 45, [['brute', -66, 50], ['normal', -58, 40], ['normal', -66, 40], ['runner', -62, 55]]);
+    spawnPickup('ammo', -54, 46);
+ 
+    // Crashed chopper: a couple of scavengers
+    spawnCluster(48, -60, [['normal', 52, -56], ['runner', 44, -63]]);
+    spawnPickup('medkit', 51, -63);
+ 
+    // Chapel: mourners who never left
+    spawnCluster(-28, -66, [['normal', -26, -64], ['normal', -30, -64], ['normal', -18, -67]]);
+    spawnPickup('ammo', -28, -71);
+}
+
 
 //------------------------------------------------
 // World Building
@@ -890,6 +2090,7 @@ function buildStaticWorld() {
     buildCollapsedHouse(-35, 15);
     buildRadioTower(TOWER_POS.x, TOWER_POS.z);
     buildSecrets();
+    buildEvacRoute();
 
     // rocks (visual only)
     for (let i = 0; i < 80; i++) {
@@ -900,6 +2101,13 @@ function buildStaticWorld() {
         rock.position.set((Math.random() - 0.5) * 300, 0.2, (Math.random() - 0.5) * 300);
         rock.castShadow = true;
         scene.add(rock);
+    }
+}
+
+// A group of guards around one spot. list: [['normal', x, z], ...]
+function spawnCluster(homeX, homeZ, list, guardRadius = 12) {
+    for (const [type, x, z] of list) {
+        createHusk(x, z, type, { home: { x: homeX, z: homeZ }, guardRadius });
     }
 }
 
@@ -914,30 +2122,66 @@ function spawnEntities() {
     spawnBarrel(19, -6.2);
     spawnBarrel(-22, 8);
     spawnBarrel(10, 27);
+    spawnBarrel(25, -12);   // gas station forecourt
+    spawnBarrel(-30, 20);   // outside the house
 
-    // Barrels around the tower for evacuation waves
+    // Barrels around the tower
     spawnBarrel(-6, -44);
     spawnBarrel(6, -56);
     spawnBarrel(-7, -55);
 
-    // Husks
-    createHusk(20, -10);
-    createHusk(-25, 5);
-    createHusk(35, 25);
-    createHusk(-30, -30);
+    // Gas station: nest inside the shop, guards on the forecourt
+    spawnNest(31.5, -21.5);
+    spawnCluster(30, -13, [['normal', 27, -14], ['normal', 33, -14], ['normal', 30, -10], ['runner', 25, -17], ['runner', 35, -16]]);
+
+    // Collapsed house: nest in the back room, guards around the door
+    spawnNest(-36.5, 17);
+    spawnCluster(-35, 20, [['normal', -35, 21], ['normal', -31, 19], ['normal', -38, 22], ['runner', -30, 14]]);
+
+    // Bus: nest behind it, a brute watching the transmitter
+    spawnNest(8, 34.5);
+    spawnCluster(15, 28, [['brute', 14, 23], ['normal', 20, 30], ['normal', 6, 26], ['runner', 12, 35]]);
+
+    // Tower guards
+    spawnCluster(0, -50, [['normal', 4, -46], ['normal', -4, -47], ['runner', 0, -57]], 10);
+
+    // A few wanderers out in the open
+    createHusk(-25, -22);
+    createHusk(35, 25, 'runner');
+    createHusk(-30, -30, 'brute', { home: { x: -30, z: -30 }, guardRadius: 10 });
 
     // One radio part at each location
     spawnPickup('battery', 30, -13); // in front of the gas station
     spawnPickup('coil', -35, 13); // inside the house
     spawnPickup('transmitter', 17.5, 27.3); // beside the bus
 
-    // Supplies
+    // Supplies (these respawn after being picked up)
     spawnPickup('medkit', -10, 0);
     spawnPickup('medkit', 20, 15);
     spawnPickup('ammo', -20, -25);
     spawnPickup('ammo', 5, -3);
+    spawnPickup('ammo', 0, 4);
+    spawnPickup('ammo', 22, -28);
+    spawnPickup('ammo', -24, 22);
     spawnPickup('ammo', 4, -44); // stocked up at the tower
     spawnPickup('medkit', -4, -44);
+
+    // Evac route: crates, barrels at the barricade, supply cache, LZ supplies
+    spawnCrate(-3, -84);
+    spawnCrate(-4.5, -84.6);
+    spawnBarricade(-98);
+    spawnBarrel(-2, -96.5);
+    spawnBarrel(2.5, -96.5);
+    spawnPickup('ammo', -5.5, -89);
+    spawnPickup('medkit', -5.5, -91);
+    spawnBarrel(-10, -130);
+    spawnBarrel(10, -146);
+    spawnBarrel(9, -128);
+    spawnPickup('ammo', -12, -150);
+    spawnPickup('ammo', 12, -150);
+    spawnPickup('medkit', 0, -125);
+
+    setupTriggers();
 }
 
 
@@ -1010,10 +2254,13 @@ function updateFx(dt) {
     }
 }
 
-function spawnTracer(end) {
+function spawnTracer(end, start = null) {
     // start at the tip of the gun barrel, not the camera
-    const start = new THREE.Vector3();
-    muzzleLight.getWorldPosition(start);
+    // our own shots start at the gun barrel; other players' shots pass in their own start
+    if (!start) {
+        start = new THREE.Vector3();
+        muzzleLight.getWorldPosition(start);
+    }
 
     const length = start.distanceTo(end);
     const tracer = new THREE.Mesh(
@@ -1059,21 +2306,10 @@ function hitMarker() {
     setTimeout(() => (crosshairEl.style.background = '#fff'), 100);
 }
 
-function killHusk(h, impulse) {
-    h.dead = true;
-    h.deathTimer = 1.5;
-
-    const q = h.mesh.quaternion;
-    h.body.quaternion.set(q.x, q.y, q.z, q.w);
-    h.body.fixedRotation = false;
-    h.body.updateMassProperties();
-    h.body.applyImpulse(impulse);
-    score += 100;
-}
 
 function shoot() {
         if (ammo <= 0) {
-            showMessage('Out of ammo!', 1);
+            showMessage('Out of ammo! Press F to shove.', 1.5);
             return;
         }
         ammo--;
@@ -1083,11 +2319,15 @@ function shoot() {
         setTimeout(() => (muzzleLight.intensity = 0), 50);
         gun.position.z += 0.08;
 
+    // gunshots are loud: nearby husks come running
+    alertHusks(playerBody.position.x, playerBody.position.z, 30);
 
     raycaster.setFromCamera(screenCenter, camera);
     raycaster.far = 100;
     const targets = [
         ...husks.filter((h) => !h.dead).map((h) => h.mesh),
+        ...nests.filter((n) => !n.dead).map((n) => n.group),
+        ...(barricade ? [barricade.group] : []),
         ...props.map((p) => p.mesh),
         ...obstacles,
     ];
@@ -1097,31 +2337,32 @@ function shoot() {
         ? hits[0].point
         : raycaster.ray.origin.clone().add(raycaster.ray.direction.clone().multiplyScalar(100));
         spawnTracer(endPoint);
+        sendShot(raycaster.ray.origin, endPoint);
 
         if (hits.length === 0) return;
 
     const hit = hits[0];
     let obj = hit.object;
-    while (obj && !obj.userData.husk && !obj.userData.prop) obj = obj.parent;
+    while (obj && !obj.userData.husk && !obj.userData.prop && !obj.userData.nest && !obj.userData.barricade) {
+        obj = obj.parent;
+    }
 
-    // green bloom splatter when hitting husks, dust everywhere else
-    spawnImpact(hit.point, obj && obj.userData.husk ? 0x66ff44 : 0xc8a878);
+    // green bloom splatter when hitting husks or nests, dust everywhere else
+    const bloom = obj && (obj.userData.husk || obj.userData.nest);
+    spawnImpact(hit.point, bloom ? 0x66ff44 : 0xc8a878);
 
     if (!obj) return;
 
     const dir = raycaster.ray.direction;
 
     if (obj.userData.husk) {
-        const h = obj.userData.husk;
-        h.hp--;
-        flashRed(h.mesh);
+        damageHusk(obj.userData.husk, 1, dir);
         hitMarker();
-        if (h.hp <= 0) {
-            killHusk(h, new CANNON.Vec3(dir.x * 400, 400, dir.z * 400));
-        } else {
-            h.stun = 0.3;
-            h.body.velocity.set(dir.x * 6, 0, dir.z * 6);
-        }
+    } else if (obj.userData.nest) {
+        damageNest(obj.userData.nest, 1);
+        hitMarker();
+    } else if (obj.userData.barricade) {
+        damageBarricade(1);
     } else {
         const p = obj.userData.prop;
         if (p.explosive) {
@@ -1158,14 +2399,24 @@ function explode(p) {
 
     const RADIUS = 6;
 
-    // husks in range will die & get flung away
+    // husks in range take 8 damage: normal husks & runners die, brutes get staggered
     for (const h of husks) {
         if (h.dead) continue;
         if (h.body.position.distanceTo(center) < RADIUS) {
             const away = h.body.position.vsub(center);
+            away.y = 0;
             away.normalize();
-            killHusk(h, new CANNON.Vec3(away.x * 600, 700, away.z * 600));
+            damageHusk(h, 8, away, 1.6);
+            if (!h.dead) {
+                h.stun = 0.8;
+                h.body.velocity.set(away.x * 8, 0, away.z * 8);
+            }
         }
+    }
+
+    // nests caught in the blast take heavy damage
+    for (const n of nests) {
+        if (!n.dead && Math.hypot(n.x - center.x, n.z - center.z) < RADIUS) damageNest(n, 8);
     }
 
     // Crates get blasted, other barrels will chain-react and explode
@@ -1196,13 +2447,21 @@ function explode(p) {
             }
         }
     }
-    // If player is standing too close, they take damage
+
+    // blow open the barricade if the blast is close enough
+    if (barricade && Math.abs(center.z - barricade.z) < RADIUS && Math.abs(center.x) < 9) {
+        breakBarricade();
+    }
+
+    // everything nearby heard that
+    alertHusks(center.x, center.z, 45);
+
+    // If player is standing too close, they take damage and get thrown
     const playerDist = playerBody.position.distanceTo(center);
     if (playerDist < RADIUS) {
-        health -= 40 * (1 - playerDist / RADIUS);
+        hurtPlayer(40 * (1 - playerDist / RADIUS), center, 14);
     }
 }
-
 
 function updateEffects(dt) {
     for (let i = effects.length - 1; i >= 0; i--) {
@@ -1225,19 +2484,21 @@ function updateEffects(dt) {
 
 //------------------------------------------------
 // Radio Tower & Win Condition
+// towerState: 'dead' -> 'broadcasting' (get to the LZ) -> 'landing' (hold the LZ) -> 'done'
+let lzHintShown = false;
+
 function updateTower(dt, time) {
-    const distToTower = Math.hypot(
-        playerBody.position.x - TOWER_POS.x,
-        playerBody.position.z - TOWER_POS.z
-    );
+    const px = playerBody.position.x;
+    const pz = playerBody.position.z;
+    const distToTower = Math.hypot(px - TOWER_POS.x, pz - TOWER_POS.z);
+    const inLZ = pz < -122 && Math.abs(px - LZ_POS.x) < 16;
 
     if (towerState === 'dead') {
         if (distToTower < 6) {
             if (partsFound === 3) {
                 towerState = 'broadcasting';
-                evacTimer = EVAC_TIME;
-                waveTimer = 0;
-                showMessage('Signal sent! Hold out until the evac chopper arrives!', 4);
+                chopper.visible = true;
+                showMessage('Signal sent! The chopper is inbound. Follow the road south to the landing zone!', 5);
             } else if (!towerHintShown) {
                 towerHintShown = true;
                 showMessage(`The tower is dead. Find the radio parts (${partsFound}/3).`, 3);
@@ -1245,22 +2506,50 @@ function updateTower(dt, time) {
         } else {
             towerHintShown = false;
         }
-    } else if (towerState === 'broadcasting') {
-        evacTimer -= dt;
-
-        const on = Math.sin(time * 8) > 0;
-        beaconLight.intensity = on ? 50 : 0;
-        beaconBulb.material.color.setHex(on ? 0xff2020 : 0x330000);
-
-        waveTimer -= dt;
-        if (waveTimer <= 0) {
-            waveTimer = 4;
-            const angle = Math.random() * Math.PI * 2;
-            createHusk(
-                playerBody.position.x + Math.cos(angle) * 30,
-                playerBody.position.z + Math.sin(angle) * 30
-            );
+        if (inLZ && !lzHintShown) {
+            lzHintShown = true;
+            showMessage('An empty landing zone. Fix the radio tower to call for evac.', 3);
         }
+        return;
+    }
+
+    // beacon blinks for the rest of the game
+    const on = Math.sin(time * 8) > 0;
+    beaconLight.intensity = on ? 50 : 0;
+    beaconBulb.material.color.setHex(on ? 0xff2020 : 0x330000);
+    rotor.rotation.y += dt * 25;
+
+    if (towerState === 'broadcasting') {
+        // chopper circles high above the LZ waiting for you
+        const angle = time * 0.3;
+        chopper.position.set(LZ_POS.x + Math.cos(angle) * 20, 45, LZ_POS.z + Math.sin(angle) * 20);
+        chopper.rotation.y = -angle;
+
+        if (inLZ) {
+            towerState = 'landing';
+            evacTimer = LAND_TIME;
+            waveTimer = 2;
+            showMessage('Hold the landing zone until the chopper touches down!', 4);
+        }
+    } else if (towerState === 'landing') {
+        evacTimer -= dt;
+        const progress = 1 - evacTimer / LAND_TIME; // 0 -> 1
+
+        // descend straight onto the helipad
+        chopper.position.set(LZ_POS.x, 45 * (1 - progress), LZ_POS.z);
+        chopper.rotation.y += (0 - chopper.rotation.y) * dt;
+
+        // waves get faster and nastier as the chopper gets closer
+        waveTimer -= dt;
+        const alive = husks.filter((h) => !h.dead).length;
+        if (waveTimer <= 0 && alive < 30) {
+            waveTimer = Math.max(1.6, 4 - progress * 2.5);
+            const [sx, sz] = LZ_SPAWNS[Math.floor(Math.random() * LZ_SPAWNS.length)];
+            let type = Math.random() < 0.4 ? 'runner' : 'normal';
+            if (progress > 0.5 && Math.random() < 0.15) type = 'brute';
+            createHusk(sx, sz, type, { alerted: true });
+        }
+
         if (evacTimer <= 0) win();
     }
 }
@@ -1269,6 +2558,7 @@ function updateTower(dt, time) {
 function win() {
     towerState = 'done';
     gameOver = true;
+    chopper.position.set(LZ_POS.x, 0, LZ_POS.z);
     score += Math.ceil(health) * 5;
     beaconLight.intensity = 0;
     controls.unlock();
@@ -1290,6 +2580,15 @@ function clearEntities() {
     for (const p of pickups) scene.remove(p.mesh);
     pickups.length = 0;
 
+    for (const n of nests) scene.remove(n.group);
+    nests.length = 0;
+
+    if (barricade) {
+        scene.remove(barricade.group);
+        world.removeBody(barricade.body);
+        barricade = null;
+    }
+
     for (const f of fx) scene.remove(f.mesh);
     fx.length = 0;
 
@@ -1304,22 +2603,28 @@ function resetGame() {
 
     for (const s of secrets) s.found = false;
     secretsFound = 0;
+    for (const zone of hazards) zone.warned = false;
 
     playerBody.position.set(0, 2, 10);
     playerBody.velocity.set(0, 0, 0);
     camera.position.set(0, 2 + EYE_HEIGHT, 10);
     camera.rotation.set(0, 0, 0);
+    knockback.set(0, 0, 0);
+    hurtEl.style.opacity = 0;
 
     health = 100;
     ammo = 30;
     partsFound = 0;
     score = 0;
+    meleeCooldown = 0;
 
     towerState = 'dead';
     evacTimer = 0;
     towerHintShown = false;
+    lzHintShown = false;
     beaconLight.intensity = 0;
     beaconBulb.material.color.setHex(0x330000);
+    chopper.visible = false;
 
     gameOver = false;
     messageEl.textContent = '';
@@ -1332,6 +2637,7 @@ function resetGame() {
 //------------------------------------------------
 // Game Loop
 const clock = new THREE.Clock();
+const lookDir = new THREE.Vector3();
 
 function animate() {
     requestAnimationFrame(animate);
@@ -1339,20 +2645,35 @@ function animate() {
     const time = clock.elapsedTime;
 
     if (!gameOver && controls.isLocked) {
-        updatePlayer();
+        meleeCooldown -= dt;
+        updatePlayer(dt);
+        updateHazards(dt, time);
         updateHusks(dt, time);
+        updateNests(dt, time);
         updatePickups(dt, time);
         updateSecrets();
+        updateTriggers();
         updateTower(dt, time);
         updateEffects(dt);
         world.step(1 / 60, dt, 3);
     }
+
+    // Multiplayer: share where we are and which way we're facing, then move other players
+    if (!gameOver) {
+        camera.getWorldDirection(lookDir);
+        sendState(dt, playerBody.position, Math.atan2(-lookDir.x, -lookDir.z));
+    }
+    updateRemotePlayers(dt);
 
     // Sync crates & barrels, (positions & rotation so they are able to tumble)
     for (const p of props) {
         p.mesh.position.copy(p.body.position);
         p.mesh.quaternion.copy(p.body.quaternion);
     }
+
+    // Keep the sun's shadow box centered on the player so shadows work on the evac route too
+    sun.position.set(playerBody.position.x + 30, 50, playerBody.position.z + 20);
+    sun.target.position.set(playerBody.position.x, 0, playerBody.position.z);
 
     updateHUD();
     if (health <= 0 && !gameOver) {
@@ -1379,6 +2700,20 @@ try {
     await loadModels();
     buildStaticWorld();
     spawnEntities();
+    initNetwork(scene, {
+        models: { female: models.female, male: models.male },
+        profile: myProfile(),
+        statusCallback: (others) => {
+            playersEl.textContent = others === 0 ? 'Playing solo' : `Survivors online: ${others + 1}`;
+        },
+        myColorCallback: (hex) => {
+            youEl.style.color = `#${hex.toString(16).padStart(6, '0')}`;
+            youEl.textContent = `You: ${myProfile().name}`;
+        },
+        remoteShotCallback: (from, to) => {
+            spawnTracer(new THREE.Vector3(to.x, to.y, to.z), new THREE.Vector3(from.x, from.y, from.z));
+        },
+    });
     ready = true;
     overlayText.textContent = 'Click to Start';
     animate();
