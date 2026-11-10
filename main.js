@@ -671,6 +671,13 @@ for (const btn of pickButtons) {
 }
 nameInput.addEventListener('change', updateProfile);
 
+let messageTimer = null;
+function showMessage(text, seconds = 2.5) {
+    messageEl.textContent = text;
+    clearTimeout(messageTimer);
+    messageTimer = setTimeout(() => (messageEl.textContent = ''), seconds * 1000);
+}
+
 function updateHUD() {
     healthEl.textContent = `Health: ${Math.max(0, Math.ceil(health))}`;
     ammoEl.textContent = `Ammo: ${ammo}`;
@@ -2091,6 +2098,12 @@ function buildStaticWorld() {
     buildRadioTower(TOWER_POS.x, TOWER_POS.z);
     buildSecrets();
     buildEvacRoute();
+    buildCheckpoint(-55, -30);
+    buildDiner(55, 15);
+    buildFarm(-60, 45);
+    buildCrashedChopper(48, -60);
+    buildChapel(-28, -72);
+    buildLoreNotes();
 
     // rocks (visual only)
     for (let i = 0; i < 80; i++) {
@@ -2180,6 +2193,7 @@ function spawnEntities() {
     spawnPickup('ammo', -12, -150);
     spawnPickup('ammo', 12, -150);
     spawnPickup('medkit', 0, -125);
+    spawnOutskirts();
 
     setupTriggers();
 }
