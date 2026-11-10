@@ -3,7 +3,6 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as CANNON from 'cannon-es';
 import { initNetwork, sendState, sendShot, sendProfile, updateRemotePlayers } from './net.js';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // Creating the Renderer, Scene, and Game Camera
 const renderer = new THREE.WebGLRenderer({ antialias: true});
@@ -65,7 +64,6 @@ world.addBody(groundBody);
 //------------------------------------------------
 // Loading Blockbench models
 // All models load at once before the game starts
-// If a model fails to load, it gets a placeholder instead
 const MODEL_FILES = {
     husk: 'models/husk_new_1.gltf',
     battery: 'models/battery.gltf',
@@ -79,8 +77,6 @@ const MODEL_FILES = {
     male: 'models/player_male.gltf',
     pistol: 'models/pistol.gltf',
     shotgun: 'models/shotgun.gltf',
-    machete: 'models/machete.gltf',
-    nest: 'models/nest.gltf',
 };
 
 const models = {};
@@ -91,7 +87,7 @@ async function loadModels() {
     const results = await Promise.allSettled(names.map((n) => loader.loadAsync(MODEL_FILES[n])));
     names.forEach((name, i) => {
         if (results[i].status === 'rejected') {
-            console.warn(`Couldn't load ${name} (${MODEL_FILES[name]}), using a placeholder`);
+            console.warn(`Couldn't load ${name}`);
             return;
         }
         const model = results[i].value.scene;
@@ -105,24 +101,15 @@ async function loadModels() {
     });
 }
 
-// Stand-in models if something doesn't load: a plain item-sized box
-function placeholderModel() {
-    const g = new THREE.Group();
-    const mesh = new THREE.Mesh(
-        new THREE.BoxGeometry(0.4, 0.3, 0.4),
-        new THREE.MeshStandardMaterial({ color: 0x8a7a5a })
-    );
-    mesh.position.y = 0.15;
-    mesh.castShadow = true;
-    g.add(mesh);
-    return g;
-}
 
-
-// Adds a copy of a model to the scene.
+// Make a copy of loaded model and add it to the scene
+// yOffset is used to shift the model inside a "holder" group
+// Physics bodies are centered in the middle, but models' origins are at the feet
+// shifting them down by half their height to line up correctly.
 function spawnModel(name, scale = 1, yOffset = 0) {
-    const inner = models[name] ? models[name].clone() : placeholderModel();
-    // Keeps material changes separate between model copies.
+    const inner = models[name].clone();
+    // Give each copy its own materials so singular items can flash without
+    // changing all models of that type
     inner.traverse((child) => {
         if (child.isMesh) child.material = child.material.clone();
     });
@@ -135,30 +122,7 @@ function spawnModel(name, scale = 1, yOffset = 0) {
     return holder;
 }
 
-// Prepares a model for use as a weapon by centering, scaling, and orienting it.
-function sizedModel(name, length, flip = false) {
-    const src = models[name] ? models[name].clone() : placeholderModel();
-    src.traverse((c) => {
-        if (c.isMesh) c.material = c.material.clone();
-    });
- 
-    const box = new THREE.Box3().setFromObject(src);
-    const size = box.getSize(new THREE.Vector3());
-    const center = box.getCenter(new THREE.Vector3());
-    src.position.sub(center);
- 
-    const orient = new THREE.Group();
-    orient.add(src);
-    const longest = Math.max(size.x, size.y, size.z) || 1;
-    if (size.x === longest) orient.rotation.y = Math.PI / 2;       // long along x: turn it forward
-    else if (size.y === longest) orient.rotation.x = -Math.PI / 2; // modeled standing up: lay it forward
-    if (flip) orient.rotateY(Math.PI);
- 
-    const holder = new THREE.Group();
-    holder.add(orient);
-    holder.scale.setScalar(length / longest);
-    return holder;
-}
+
 
 //------------------------------------------------
 // Helper Functions
@@ -230,104 +194,11 @@ function part(group, w, h, d, x, y, z, color, rotX = 0, rotY = 0, rotZ = 0) {
     return mesh;
 }
 
-// Combines building meshes by material to improve performance.
-function mergeGroup(group) {
-    group.updateMatrixWorld(true);
-    const inverse = new THREE.Matrix4().copy(group.matrixWorld).invert();
-    const buckets = new Map();
- 
-    group.traverse((c) => {
-        if (!c.isMesh) return;
-        for (let a = c; a && a !== group; a = a.parent) if (a.userData.keep) return;
-        const m = c.material;
-        if (!m || !m.isMeshStandardMaterial || m.map || m.transparent) return;
-        const key = `${m.color.getHex()}|${m.emissive.getHex()}|${m.emissiveIntensity}|${m.flatShading}|${c.geometry.index ? 1 : 0}`;
-        if (!buckets.has(key)) buckets.set(key, { material: m, meshes: [] });
-        buckets.get(key).meshes.push(c);
-    });
- 
-    for (const { material, meshes } of buckets.values()) {
-        if (meshes.length < 2) continue;
-        const geos = meshes.map((c) =>
-            c.geometry.clone().applyMatrix4(new THREE.Matrix4().multiplyMatrices(inverse, c.matrixWorld))
-        );
-        const merged = mergeGeometries(geos, false);
-        if (!merged) continue; // couldn't merge: leave the parts as they are
-        for (const c of meshes) c.parent.remove(c);
-        const mesh = new THREE.Mesh(merged, material);
-        mesh.castShadow = true;
-        mesh.receiveShadow = true;
-        group.add(mesh);
-    }
-}
-
 function finishBuilding(group, x, z) {
     group.position.set(x, 0, z);
     scene.add(group);
-    mergeGroup(group);
     obstacles.push(group);
 }
-
-// Adds a physics collider to the world.
-function addSolid(w, h, d, x, y, z, rotX = 0, rotY = 0) {
-    const body = new CANNON.Body({
-        mass: 0,
-        shape: new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)),
-        position: new CANNON.Vec3(x, y, z),
-    });
-    body.quaternion.setFromEuler(rotX, rotY, 0);
-    world.addBody(body);
- 
-    // Shows the collider when debug mode is enabled.
-    if (SHOW_COLLIDERS) {
-        const debug = new THREE.Mesh(
-            new THREE.BoxGeometry(w, h, d),
-            new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true })
-        );
-        debug.position.set(x, y, z);
-        debug.rotation.set(rotX, rotY, 0);
-        scene.add(debug);
-    }
-}
-
-// Helper for adding objects and collision inside buildings.
-function makeBuilder(x, z, flip = false) {
-    const g = new THREE.Group();
-    const f = flip ? -1 : 1;
-    return {
-        g, x, z, flip,
-        // Converts building coordinates to world coordinates.
-        at: (lx, lz) => ({ x: x + lx, z: z + lz * f }),
-        // Adds a visible object without collision.
-        box(w, h, d, lx, ly, lz, color, rx = 0, ry = 0, rz = 0) {
-            return part(g, w, h, d, lx, ly, lz * f, color, rx * f, ry * f, rz);
-        },
-        // Adds a visible object with collision.
-        solid(w, h, d, lx, ly, lz, color) {
-            part(g, w, h, d, lx, ly, lz * f, color);
-            addSolid(w, h, d, x + lx, ly, z + lz * f);
-        },
-        // Adds an invisible collision box.
-        block(w, h, d, lx, ly, lz) {
-            addSolid(w, h, d, x + lx, ly, z + lz * f);
-        },
-        // Adds the finished building to the scene.
-        finish() {
-            finishBuilding(g, x, z);
-        },
-    };
-}
-
-// Keep trees and rocks from spawning inside buildings or on roads
-const reserved = [];
-function reserve(x1, z1, x2, z2) {
-    reserved.push([Math.min(x1, x2), Math.min(z1, z2), Math.max(x1, x2), Math.max(z1, z2)]);
-}
-function isFree(x, z, margin = 1) {
-    return !reserved.some(([x1, z1, x2, z2]) =>
-        x > x1 - margin && x < x2 + margin && z > z1 - margin && z < z2 + margin);
-}
-
 
 // GAS STATION BUILD
 function buildGasStation(x, z) {
@@ -474,7 +345,6 @@ function buildRadioTower(x, z) {
         new THREE.MeshBasicMaterial({ color: 0x330000 })
     );
     beaconBulb.position.set(0, 26.7, 0);
-    beaconBulb.userData.keep = true;
     g.add(beaconBulb);
 
     beaconLight = new THREE.PointLight(0xff2020, 0, 40);
@@ -674,7 +544,6 @@ function spawnBarrel(x, z) {
 function spawnBus(x, z) {
     const busModel = buildSchoolBus();
     busModel.position.y = -1.4;
-    mergeGroup(busModel);
 
     const holder = new THREE.Group();
     holder.add(busModel);
@@ -701,14 +570,10 @@ function spawnBus(x, z) {
 //------------------------------------------------
 // Player
 // Invisible physics sphere where the camera sits on top
-// Where you spawn (and respawn with `R`): by the farmhouse, facing the dirt path into town
-const SPAWN = { x: -63, z: 103, yaw: -1.16 };
-
-
 const playerBody = new CANNON.Body({
     mass: 70,
     shape: new CANNON.Sphere(0.5),
-    position: new CANNON.Vec3(SPAWN.x, 2, SPAWN.z),
+    position: new CANNON.Vec3(0, 2, 10),
     fixedRotation: true, // don't let the sphere roll
 });
 world.addBody(playerBody);
@@ -761,7 +626,6 @@ const partsEl = document.getElementById('parts');
 const scoreEl = document.getElementById('score');
 const crosshairEl = document.getElementById('crosshair');
 const objectiveEl = document.getElementById('objective');
-const weaponsEl = document.getElementById('weapons');
 
 
 overlay.addEventListener('click', () => { if (ready && !gameOver) controls.lock(); });
@@ -778,12 +642,6 @@ document.addEventListener('keydown', (e) => {
     keys[e.code] = true; 
     if (e.code === 'KeyR' && ready) resetGame();
     if (e.code === 'KeyF' && controls.isLocked && !gameOver) shove();
-    if (e.code === 'KeyE' && controls.isLocked && !gameOver) interact();
-    if (controls.isLocked && !gameOver) {
-        if (e.code === 'Digit1') equip('pistol');
-        if (e.code === 'Digit2') equip('shotgun');
-        if (e.code === 'Digit3') equip('machete');
-    }
 });
 document.getElementById('profile').addEventListener('click', (e) => e.stopPropagation());
 document.addEventListener('keyup', (e) => (keys[e.code] = false));
@@ -822,13 +680,7 @@ function showMessage(text, seconds = 2.5) {
 
 function updateHUD() {
     healthEl.textContent = `Health: ${Math.max(0, Math.ceil(health))}`;
-    const w = WEAPONS[weapon];
-    ammoEl.textContent = w.melee ? w.name : `${w.name}: ${w.ammo === 'shells' ? shells : ammo}`;
-    if (weaponsEl) {
-        weaponsEl.textContent = WEAPON_ORDER.filter((k) => owned[k])
-            .map((k) => (k === weapon ? `[${WEAPONS[k].slot} ${WEAPONS[k].name}]` : `${WEAPONS[k].slot} ${WEAPONS[k].name}`))
-            .join('  ');
-    }
+    ammoEl.textContent = `Ammo: ${ammo}`;
     partsEl.textContent = `Parts: ${partsFound}/3`;
     scoreEl.textContent = `Score: ${score}`;
 
@@ -927,7 +779,7 @@ const HUSK_TYPES = {
 // home: if given, the husk is a guard. It shuffles around home, only notices you
 //       inside guardRadius, and walks back if you lead it too far away.
 // alerted: spawn already hunting the player (ambushes, nest spawns, evac waves)
-function createHusk(x, z, type = 'normal', { home = null, guardRadius = 12, alerted = false, y = 0 } = {}) {
+function createHusk(x, z, type = 'normal', { home = null, guardRadius = 12, alerted = false } = {}) {
     const t = HUSK_TYPES[type];
     const radius = 0.5 * t.scale;
     const mesh = spawnModel('husk', t.scale * HUSK_MODEL_SCALE, -radius);
@@ -941,11 +793,10 @@ function createHusk(x, z, type = 'normal', { home = null, guardRadius = 12, aler
     const body = new CANNON.Body({
         mass: t.heavy ? 200 : 50,
         shape: new CANNON.Sphere(radius),
-        position: new CANNON.Vec3(x, y + radius, z),
+        position: new CANNON.Vec3(x, radius, z),
         fixedRotation: true,
     });
     world.addBody(body);
-    mesh.position.copy(body.position);
 
     const husk = {
         type, t, mesh, body, radius,
@@ -1001,76 +852,6 @@ function moveToward(h, tx, tz, speed) {
     return d;
 }
 
-// Every staircase (filled in by buildMultiStory), so husks know how to get
-// up, down, in and out of buildings: { area, floorY, bottom, top, doorIn, doorOut }
-const stairways = [];
- 
-function inArea(a, x, z) {
-    return x > a.x1 && x < a.x2 && z > a.z1 && z < a.z2;
-}
-
-// Handles enemy movement between buildings and floors.
-function huskTarget(h, px, py, pz) {
-    const hx = h.body.position.x;
-    const hy = h.body.position.y;
-    const hz = h.body.position.z;
-    const near = (p, r = 1.3) => Math.hypot(hx - p.x, hz - p.z) < r;
-
-    // Keeps enemies aligned with the stairs while climbing.
-    const along = (dest) => {
-        const dz = dest.z - hz;
-        return Math.abs(dz) < 1.2 ? dest : { x: dest.x, z: hz + Math.sign(dz) };
-    };
-
-    const upper = FLOOR_H - 0.4;
-    const pUp = py > upper;
-    const hUp = hy > upper;
-    const pB = stairways.find((s) => inArea(s.area, px, pz));
-    const hB = stairways.find((s) => inArea(s.area, hx, hz));
-    const chase = { x: px, z: pz };
-
-    // Handles enemies already upstairs.
-    if (hB && hUp) {
-        if (h.stairStage === 'up') {
-            if (near(hB.top, 1.0)) h.stairStage = null;
-            else return along(hB.top);
-        }
-        if (pB === hB && pUp) {
-            h.stairStage = null;
-            return chase;
-        }
-        if (h.stairStage !== 'down' && near(hB.top, 1.0)) h.stairStage = 'down';
-        return h.stairStage === 'down' ? along(hB.bottom) : hB.top;
-    }
-
-    // Handles enemies on or near the stairs.
-    if (hB) {
-        if (pB === hB && pUp) {
-            // Larger enemies cannot use the stairs.
-            if (h.t.heavy) return hB.bottom;
-            if (h.stairStage !== 'up' && near(hB.bottom, 1.0)) h.stairStage = 'up';
-            return h.stairStage === 'up' ? along(hB.top) : hB.bottom;
-        }
-        if (h.stairStage === 'down' && hy > 1) return along(hB.bottom);
-        if (pB !== hB) {
-            // Sends enemies outside through the building's door.
-            if (h.stairStage !== 'exit' && near(hB.doorIn)) h.stairStage = 'exit';
-            return h.stairStage === 'exit' ? hB.doorOut : hB.doorIn;
-        }
-        h.stairStage = null;
-        return chase;
-    }
-
-    // Guides enemies outside toward the player's building.
-    if (pB) {
-        if (h.stairStage !== 'enter' && near(pB.doorOut)) h.stairStage = 'enter';
-        return h.stairStage === 'enter' ? pB.doorIn : pB.doorOut;
-    }
-
-    h.stairStage = null;
-    return chase;
-}
-
 function updateHusks(dt, time) {
     // Loop backwards so removing a dead husk doesn't skip the next one
     for (let i = husks.length - 1; i >= 0; i--) {
@@ -1094,9 +875,6 @@ function updateHusks(dt, time) {
         const dx = px - h.body.position.x;
         const dz = pz - h.body.position.z;
         const dist = Math.hypot(dx, dz);
-
-        // only fight on the same floor as the player, otherwise wander around, don't bite through the ceiling/floir
-        const sameFloor = Math.abs(playerBody.position.y - h.body.position.y) < 1.5;
         const inner = h.mesh.children[0];
         inner.scale.y = h.t.scale * HUSK_MODEL_SCALE; // undo the wind-up crouch
 
@@ -1146,13 +924,12 @@ function updateHusks(dt, time) {
             if (!interested || (farFromHome && dist > 10 && h.alertTimer <= 0)) {
                 // lost interest: guards go home, wanderers just stop
                 h.mode = h.home ? 'return' : 'idle';
-            } else if (sameFloor && dist < h.t.lungeRange && dist > 1.2 && h.lungeCooldown <= 0) {
+            } else if (dist < h.t.lungeRange && dist > 1.2 && h.lungeCooldown <= 0) {
                 h.mode = 'windup';
                 h.modeTimer = h.t.windup;
                 setGlow(h.mesh, 0x663300);
-            } else if (dist > h.radius + 0.6 || !sameFloor || h.stairStage) {
-                const target = huskTarget(h, px, playerBody.position.y, pz);
-                moveToward(h, target.x, target.z, h.t.speed);
+            } else if (dist > h.radius + 0.6) {
+                moveToward(h, px, pz, h.t.speed);
             } else {
                 h.body.velocity.x = 0;
                 h.body.velocity.z = 0;
@@ -1180,7 +957,7 @@ function updateHusks(dt, time) {
         }
 
         // Melee hit: one solid hit per second instead of constant drain
-        if (sameFloor && dist < h.radius + 1.0 && h.attackCooldown <= 0 && h.stun <= 0 && !gameOver) {
+        if (dist < h.radius + 1.0 && h.attackCooldown <= 0 && h.stun <= 0 && !gameOver) {
             h.attackCooldown = h.t.heavy ? 1.5 : 1;
             hurtPlayer(h.t.damage, h.body.position, h.t.heavy ? 16 : 6);
             if (h.mode === 'lunge') {
@@ -1236,48 +1013,30 @@ function killHusk(h, impulse) {
     // Loot! Dropped pickups vanish after a while
     const x = h.body.position.x;
     const z = h.body.position.z;
-    const floorY = Math.max(0, h.body.position.y - h.radius - 0.1);
-    if (Math.random() < h.t.drop) spawnPickup(Math.random() < 0.25 ? 'shells' : 'ammo', x, z, { temporary: true, y: floorY });
-    if (h.type === 'brute') spawnPickup('medkit', x + 1, z, { temporary: true, y: floorY });
+    if (Math.random() < h.t.drop) spawnPickup('ammo', x, z, { temporary: true });
+    if (h.type === 'brute') spawnPickup('medkit', x + 1, z, { temporary: true });
 }
 
 
 //------------------------------------------------
-// Item Pick Ups (press E)
+// Item Pick Ups
 // respawn: seconds before a collected supply comes back (radio parts never respawn)
-// length: weapons are sized by their longest size since blockbench scales vary from my models
-
 const PICKUP_TYPES = {
-    battery:     { model: 'battery', scale: 2, radio: true, label: 'the battery' },
-    coil:        { model: 'coil', scale: 1.5, radio: true, label: 'the antenna coil' },
-    transmitter: { model: 'transmitter', scale: 2, radio: true, label: 'the transmitter' },
-    medkit:      { model: 'medkit', scale: 1.5, respawn: 60, label: 'Medkit' },
-    ammo:        { model: 'ammo', scale: 1.5, respawn: 40, label: 'Pistol ammo' },
-    shells:      { model: 'ammo', scale: 1.5, respawn: 50, label: 'Shotgun shells', tint: 0xb04a2a },
-    shotgun:     { model: 'shotgun', weapon: 'shotgun', length: 0.9, label: 'the Shotgun' },
-    machete:     { model: 'machete', weapon: 'machete', length: 0.7, label: 'the Machete' },
+    battery:        { model: 'battery', scale: 2, radio: true, name: 'the battery' },
+    coil:           { model: 'coil', scale: 1.5, radio: true, name: 'the antenna coil' },
+    transmitter:    { model: 'transmitter', scale: 2, radio: true, name: 'the transmitter' },
+    medkit:         { model: 'medkit', scale: 1.5, respawn: 60 },
+    ammo:           { model: 'ammo', scale: 1.5, respawn: 40 },
 };
 
 const pickups = [];
 
 // temporary: loot dropped by husks/nests. Blinks and disappears after 25s, never respawns
-// y: height of the floor it sits on (for pickups upstairs or on tables)
-function spawnPickup(type, x, z, { temporary = false, y = 0 } = {}) {
+function spawnPickup(type, x, z, { temporary = false } = {}) {
     const config = PICKUP_TYPES[type];
-    let mesh;
-    if (config.length) {
-        mesh = new THREE.Group();
-        mesh.add(sizedModel(config.model, config.length));
-        scene.add(mesh);
-    } else {
-        mesh = spawnModel(config.model, config.scale, 0);
-    }
-    if (config.tint) {
-        const tint = new THREE.Color(config.tint);
-        mesh.traverse((c) => { if (c.isMesh) c.material.color.lerp(tint, 0.6); });
-    }
-    mesh.position.set(x, y + 0.6, z);
- 
+    const mesh = spawnModel(config.model, config.scale, 0);
+    mesh.position.set(x, 0.6, z);
+
     // radio parts get additional yellow glow to stand out in the fog
     if (config.radio) {
         const glow = new THREE.PointLight(0xffd84a, 3, 5);
@@ -1285,7 +1044,7 @@ function spawnPickup(type, x, z, { temporary = false, y = 0 } = {}) {
         mesh.add(glow);
     }
 
-    const p = { type, mesh, baseY: y, collected: false, respawnTimer: 0, temporary, life: 25 };
+    const p = { type, mesh, collected: false, respawnTimer: 0, temporary, life: 25 };
     pickups.push(p);
     return p;
 }
@@ -1294,41 +1053,31 @@ function collect(p) {
     const config = PICKUP_TYPES[p.type];
 
     // don't waste a medkit at full health, leave it for later
-    if (p.type === 'medkit' && health >= 100) {
-        showMessage('Your health is already full.', 1.5);
-        return;
-    }
+    if (p.type === 'medkit' && health >= 100) return;
 
     p.collected = true;
-    if (config.respawn && !p.temporary) {
+    if (config.radio || p.temporary) {
+        scene.remove(p.mesh);
+    } else {
         // hide it and start the respawn countdown
         p.mesh.visible = false;
         p.respawnTimer = config.respawn;
-    } else {
-        scene.remove(p.mesh);
     }
- 
+
     if (config.radio) {
         partsFound++;
         score += 100;
         if (partsFound === 3) {
             showMessage('All parts found! Get to the radio tower.', 5);
         } else {
-            showMessage(`Found ${config.label}! (${partsFound}/3)`);
+            showMessage(`Found ${config.name}! (${partsFound}/3)`);
         }
-    } else if (config.weapon) {
-        giveWeapon(config.weapon);
-        if (config.weapon === 'shotgun') shells += 6;
-        showMessage(`Picked up ${config.label}! Press ${WEAPONS[config.weapon].slot} to switch to it.`, 3.5);
     } else if (p.type === 'medkit') {
         health = Math.min(100, health + 35);
         showMessage('+35 health');
     } else if (p.type === 'ammo') {
         ammo += 15;
-        showMessage('+15 pistol ammo');
-    } else if (p.type === 'shells') {
-        shells += 6;
-        showMessage('+6 shotgun shells');
+        showMessage('+15 ammo');
     }
 }
 
@@ -1345,7 +1094,7 @@ function updatePickups(dt, time) {
                     p.mesh.visible = true;
                 }
             } else {
-                pickups.splice(i, 1); // radio parts, weapons & loot are gone for good
+                pickups.splice(i, 1); // radio parts & loot are gone for good
             }
             continue;
         }
@@ -1362,7 +1111,13 @@ function updatePickups(dt, time) {
         }
 
         p.mesh.rotation.y += dt * 1.5;
-        p.mesh.position.y = p.baseY + 0.6 + Math.sin(time * 2) * 0.15;
+        p.mesh.position.y = 0.6 + Math.sin(time * 2) * 0.15;
+
+        const dist = Math.hypot(
+            playerBody.position.x - p.mesh.position.x,
+            playerBody.position.z - p.mesh.position.z,
+        );
+        if (dist < 1.5) collect(p);
     }
 }
 
@@ -1373,22 +1128,24 @@ const secrets = [];
 let secretsFound = 0;
 
 // Building a small object from boxes and registering it as a secret
-// y: height it sits at (a table, an upper floor)
-function addSecret(x, z, build, message, y = 0) {
+function addSecret(x, z, build, message) {
     const g = new THREE.Group();
     build(g);
-    g.position.set(x, y, z);
+    g.position.set(x, 0, z);
     scene.add(g);
-    secrets.push({ x, y, z, message, found: false });
+    secrets.push({ x, z, message, found: false });
 }
 
 function buildSecrets() {
     // 1. Survivor's note on the floor inside collapsed house
-    addSecret(...at('house', -2.5, -1.5), (g) => notePaper(g),
-        'A scrawled note: "Day 212. The Bloom took Marcus today. Tower 9 still has power... I think"');
- 
-    // 2. A lonely teddy bear near the crash site
-    addSecret(...at('crash', -8, -8), (g) => {
+    addSecret(-37.5, 13.5, (g) => {
+        part(g, 0.3, 0.002, 0.4, 0, 0.01, 0, 0xe8e0c8, 0, 0.4, 0);
+        part(g, 0.2, 0.025, 0.03, 0, 0.012, -0.05, 0x333333, 0, 0.3, 0);
+        part(g, 0.2, 0.025, 0.03, 0, 0.012, 0.05, 0x333333, 0, 0.4, 0);
+    }, 'A scrawled note: "Day 212. The Bloom took Marcus today. Tower 9 still has power... I think"');
+
+    // 2. A lonely teddy bear out in the wasteland
+    addSecret(55, -45, (g) => {
         const FUR = 0x9c7a55;
         part(g, 0.35, 0.4, 0.25, 0, 0.2, 0, FUR);
         part(g, 0.3, 0.28, 0.25, 0, 0.54, 0, FUR);
@@ -1396,182 +1153,100 @@ function buildSecrets() {
         part(g, 0.1, 0.1, 0.06, 0.12, 0.72, 0, FUR);
         part(g, 0.04, 0.04, 0.02, 0.06, 0.56, 0.13, 0x111111);
         part(g, 0.1, 0.1, 0.05, 0, 0.48, 0.13, 0xc4a77f);
-    }, 'A sun bleached teddy bear, missing an eye. Someone loved this once. I wonder if they made it out.');
- 
+    }, 'A sun bleached teddy bear, missing an eye. Someone loved this once. I wonder if they made it out.' );
+
     // RIP (;
     addSecret(-12, -62, (g) => {
         part(g, 0.8, 0.15, 1.4, 0, 0.07, 0, 0x6e5a48);
         part(g, 0.1, 1.0, 0.1, 0, 0.5, -0.6, 0x594638);
         part(g, 0.5, 0.1, 0.1, 0, 0.75, -0.6, 0x594638);
     }, 'Here lies Renee\'s sleep schedule. 2026-2026. Gone but not forgotten');
+
 }
 
-//------------------------------------------------
-// Interacting (E), picking things up and reading notes
-const promptEl = document.getElementById('prompt');
-const noteEl = document.getElementById('note');
-const noteTextEl = document.getElementById('note-text');
-const noteCountEl = document.getElementById('note-count');
-const REACH = 2;     // how close you need to be
-let focus = null;    // what E would use right now: { pickup } or { secret }
-let openNote = null; // the secret currently shown on screen
- 
-function updateInteraction() {
-    const px = playerBody.position.x;
-    const pz = playerBody.position.z;
-    const feet = playerBody.position.y - 0.5; // height of the floor you're standing on
-    let best = null;
-    let bestDist = REACH;
- 
-    for (const p of pickups) {
-        if (p.collected) continue;
-        const d = Math.hypot(px - p.mesh.position.x, pz - p.mesh.position.z);
-        if (d < bestDist && Math.abs(feet - p.baseY) < 1.5) {
-            best = { pickup: p };
-            bestDist = d;
-        }
-    }
+function updateSecrets() {
     for (const s of secrets) {
-        const d = Math.hypot(px - s.x, pz - s.z);
-        if (d < bestDist && Math.abs(feet - s.y) < 1.5) {
-            best = { secret: s };
-            bestDist = d;
+        if (s.found) continue;
+        const dist = Math.hypot(playerBody.position.x - s.x, playerBody.position.z - s.z);
+        if (dist < 2) {
+            s.found = true;
+            secretsFound++;
+            score += 50;
+            showMessage(`${s.message} (Secret ${secretsFound}/${secrets.length})`, 5);
         }
     }
-    focus = best;
- 
-    // walking away closes the note
-    if (openNote && (!focus || focus.secret !== openNote)) closeNote();
- 
-    if (!focus || openNote) {
-        promptEl.style.display = 'none';
-        return;
-    }
-    promptEl.style.display = 'block';
-    if (focus.pickup) {
-        const p = focus.pickup;
-        promptEl.textContent = p.type === 'medkit' && health >= 100
-            ? 'Medkit (your health is full)'
-            : `[E] Pick up ${PICKUP_TYPES[p.type].label}`;
-    } else {
-        promptEl.textContent = focus.secret.found ? '[E] Read again' : '[E] Read';
-    }
-}
- 
-function interact() {
-    if (openNote) {
-        closeNote();
-        return;
-    }
-    if (!focus) return;
-    if (focus.pickup) collect(focus.pickup);
-    else openSecret(focus.secret);
-}
- 
-function openSecret(s) {
-    if (!s.found) {
-        // first time reading: count it and give the score
-        s.found = true;
-        secretsFound++;
-        score += 50;
-    }
-    openNote = s;
-    noteTextEl.textContent = s.message;
-    noteCountEl.textContent = `Secrets found: ${secretsFound}/${secrets.length}`;
-    noteEl.style.display = 'block';
-    promptEl.style.display = 'none';
-}
- 
-function closeNote() {
-    openNote = null;
-    noteEl.style.display = 'none';
 }
 
 //------------------------------------------------
 // Bloom Nests
-// Glowing ods inside buildings that keep spawning husks until you destroy them.
+// Glowing pods inside buildings that keep spawning husks until you shoot them
 const nests = [];
 const NEST_GLOW = 0x66ff44;
-const NEST_SCALE = 2.4; // same as the husks, if the nest is built at the same Blockbench scale
- 
+
 function spawnNest(x, z) {
     const g = new THREE.Group();
- 
-    let pod;
-    if (models.nest) {
-        pod = spawnModel('nest', NEST_SCALE, 0);
-        g.add(pod);
-        // only the "core" group glows, the rest keeps its texture
-        const core = pod.getObjectByName('core');
-        if (core) core.traverse((c) => {
-            if (c.isMesh) {
-                c.material.emissive.setHex(NEST_GLOW);
-                c.material.emissiveIntensity = 0.6;
-            }
-        });
-    } else {
-        pod = new THREE.Mesh(
-            new THREE.SphereGeometry(0.8, 12, 10),
-            new THREE.MeshStandardMaterial({ color: 0x3f6a2a, emissive: NEST_GLOW, emissiveIntensity: 0.5, flatShading: true })
-        );
-        pod.position.y = 0.9;
-        g.add(pod);
- 
-        // roots spreading out across the floor
-        for (let i = 0; i < 6; i++) {
-            const a = (i / 6) * Math.PI * 2;
-            part(g, 0.15, 0.1, 1.6, Math.cos(a) * 1.1, 0.05, Math.sin(a) * 1.1, 0x2f4a22, 0, Math.PI / 2 - a, 0);
-        }
+
+    const pod = new THREE.Mesh(
+        new THREE.SphereGeometry(0.8, 12, 10),
+        new THREE.MeshStandardMaterial({ color: 0x3f6a2a, emissive: NEST_GLOW, emissiveIntensity: 0.5, flatShading: true })
+    );
+    pod.position.y = 0.9;
+    g.add(pod);
+
+    // roots spreading out across the floor
+    for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2;
+        part(g, 0.15, 0.1, 1.6, Math.cos(a) * 1.1, 0.05, Math.sin(a) * 1.1, 0x2f4a22, 0, Math.PI / 2 - a, 0);
     }
- 
+
     const light = new THREE.PointLight(NEST_GLOW, 4, 10);
     light.position.y = 1;
     g.add(light);
- 
+
     g.position.set(x, 0, z);
     scene.add(g);
- 
-    const nest = { group: g, pod, light, x, z, hp: 12, spawnTimer: 3, dead: false, baseScale: pod.scale.x };
+
+    const nest = { group: g, pod, x, z, hp: 12, spawnTimer: 3, dead: false };
     g.userData.nest = nest;
     nests.push(nest);
 }
- 
+
 function updateNests(dt, time) {
     for (const n of nests) {
         if (n.dead) continue;
- 
+
         // slow breathing pulse
-        n.pod.scale.setScalar(n.baseScale * (1 + Math.sin(time * 3) * 0.06));
- 
+        const pulse = 1 + Math.sin(time * 3) * 0.06;
+        n.pod.scale.set(pulse, 1.3 * pulse, pulse);
+
         // only active while the player is nearby
         const dist = Math.hypot(playerBody.position.x - n.x, playerBody.position.z - n.z);
         if (dist > 35) continue;
- 
+
         n.spawnTimer -= dt;
         if (n.spawnTimer > 0) continue;
         n.spawnTimer = 10;
- 
+
         // cap how many husks one nest can have around it
         const nearby = husks.filter((h) => !h.dead &&
             Math.hypot(h.body.position.x - n.x, h.body.position.z - n.z) < 15).length;
         if (nearby >= 5) continue;
- 
+
         const a = Math.random() * Math.PI * 2;
         createHusk(n.x + Math.cos(a) * 1.5, n.z + Math.sin(a) * 1.5,
             Math.random() < 0.3 ? 'runner' : 'normal',
             { home: { x: n.x, z: n.z }, alerted: dist < 20 });
     }
 }
- 
+
 function damageNest(n, amount) {
     if (n.dead) return;
     n.hp -= amount;
-    // flash the light red (works for the model and the egg)
-    n.light.color.setHex(0xff3030);
-    setTimeout(() => n.light.color.setHex(NEST_GLOW), 100);
+    n.pod.material.emissive.setHex(0xff3030);
+    setTimeout(() => n.pod.material.emissive.setHex(NEST_GLOW), 100);
     if (n.hp <= 0) destroyNest(n);
 }
- 
+
 function destroyNest(n) {
     n.dead = true;
     scene.remove(n.group);
@@ -1604,7 +1279,7 @@ function shove() {
 
     let hitSomething = false;
     for (const h of husks) {
-        if (h.dead || Math.abs(h.body.position.y - playerBody.position.y) > 1.5) continue;
+        if (h.dead) continue;
         const dx = h.body.position.x - playerBody.position.x;
         const dz = h.body.position.z - playerBody.position.z;
         const d = Math.hypot(dx, dz) || 0.01;
@@ -1667,57 +1342,27 @@ function buildWall(x1, z1, x2, z2) {
     addStaticCollider(alongX ? len : 0.6, 3.3, alongX ? 0.6 : len, cx, cz);
 }
 
-// Cars are props: buildCar() just records where they go while the world is built,
-// spawnCars() (called from spawnEntities) creates them, so R puts them back.
-const carSpawns = [];
+// Wrecked car, built out of boxes like the bus. Length runs along x before rotating.
 function buildCar(x, z, rotY = 0, color = 0x6a5a4a, burnt = false) {
-    carSpawns.push({ x, z, rotY, color, burnt });
-}
-
-// The car's look, built out of boxes like the bus. Length runs along x.
-function buildCarModel(color, burnt) {
     const g = new THREE.Group();
     const BODY = burnt ? 0x2e2a26 : color;
     const DARK = 0x2a2724;
     const GLASS = 0x3e4a48;
     const RUST = 0x75452f;
 
-    part(g, 4.2, 0.8, 1.9, 0, 0.7, 0, BODY);                   // lower body
-    part(g, 2.2, 0.7, 1.7, -0.2, 1.45, 0, BODY);               // cabin
-    part(g, 0.06, 0.6, 1.6, 0.95, 1.4, 0, GLASS, 0, 0, -0.5);  // windshield
+    part(g, 4.2, 0.8, 1.9, 0, 0.7, 0, BODY);               // lower body
+    part(g, 2.2, 0.7, 1.7, -0.2, 1.45, 0, BODY);           // cabin
+    part(g, 0.06, 0.6, 1.6, 0.95, 1.4, 0, GLASS, 0, 0, -0.5); // windshield
     for (const sx of [-1.3, 1.3]) {
         for (const sz of [-0.95, 0.95]) part(g, 0.7, 0.7, 0.3, sx, 0.35, sz, DARK); // wheels
     }
     part(g, 0.9, 0.3, 0.02, 0.8, 0.75, 0.96, RUST);
     part(g, 0.6, 0.25, 0.02, -1.2, 0.6, -0.96, RUST);
     part(g, 1.2, 0.05, 1.0, 1.4, 1.12, 0.1, BODY, 0, 0.2, 0.3); // hood popped open
-    mergeGroup(g);
-    return g;
-}
 
-function spawnCar({ x, z, rotY, color, burnt }) {
-    const model = buildCarModel(color, burnt);
-    model.position.y = -0.9; // physics box is centered, the model's origin is at the ground
-
-    const holder = new THREE.Group();
-    holder.add(model);
-    scene.add(holder);
-
-    // frozen in place (mass 0) until a blast wakes it up, just like the bus
-    const body = new CANNON.Body({ mass: 0, position: new CANNON.Vec3(x, 0.9, z) });
-    body.addShape(new CANNON.Box(new CANNON.Vec3(2.15, 0.9, 1.0)));
-    body.quaternion.setFromEuler(0, rotY, 0);
-    body.linearDamping = 0.5;  // the ground has no friction, so this stops them sliding forever
-    body.angularDamping = 0.5;
-    world.addBody(body);
-
-    const prop = { mesh: holder, body, dormant: true, blastScale: 12, wakeMass: 250 };
-    holder.userData.prop = prop;
-    props.push(prop);
-}
-
-function spawnCars() {
-    for (const c of carSpawns) spawnCar(c);
+    g.rotation.y = rotY;
+    finishBuilding(g, x, z);
+    addStaticCollider(4.3, 1.8, 2.0, x, z, rotY);
 }
 
 // Hazard zones: rectangles the player gets hurt/slowed in
@@ -1994,19 +1639,19 @@ function buildCheckpoint(x, z) {
     const WHITE = 0xcfc8b0;
  
     // Two army tents: canvas body, peaked roof, open flap facing the camp
-    for (const tx of [-6, 6]) {
+    for (const tx of [-5, 5]) {
         part(g, 5, 2.2, 4, tx, 1.1, -4, CANVAS);
         part(g, 5.2, 0.12, 2.4, tx, 2.6, -5, OLIVE, -0.5, 0, 0);
         part(g, 5.2, 0.12, 2.4, tx, 2.6, -3, OLIVE, 0.5, 0, 0);
         part(g, 1.2, 1.8, 0.05, tx, 0.9, -1.97, DARK);
     }
  
-    // Field desk infront of the left tent, with a dead radio on it
-    part(g, 1.6, 0.08, 0.9, -6, 0.75, -0.9, OLIVE);
+    // Field desk between the tents, with a dead radio on it
+    part(g, 1.6, 0.08, 0.9, 0, 0.75, -4, OLIVE);
     for (const [lx, lz] of [[-0.7, -0.4], [0.7, -0.4], [-0.7, 0.4], [0.7, 0.4]]) {
-        part(g, 0.06, 0.75, 0.06, -6 + lx, 0.37, -0.9 + lz, DARK);
+        part(g, 0.06, 0.75, 0.06, lx, 0.37, -4 + lz, DARK);
     }
-    part(g, 0.4, 0.25, 0.3, -5.5, 0.92, -1.1, DARK);
+    part(g, 0.4, 0.25, 0.3, 0.5, 0.92, -4.2, DARK);
  
     // Sandbag wall with a gap in the middle for the gate
     for (let sx = -9; sx <= 9; sx += 0.9) {
@@ -2024,8 +1669,8 @@ function buildCheckpoint(x, z) {
     }
  
     // Fence along the back
-    for (let fx = -10; fx <= 10; fx += 2.5) if (Math.abs(fx) > 3) part(g, 0.12, 2.2, 0.12, fx, 1.1, -8, METAL);
-    for (const y of [0.4, 1.2, 2.0]) for (const s of [-1, 1]) part(g, 7, 0.04, 0.04, s * 6.5, y, -8, METAL);
+    for (let fx = -10; fx <= 10; fx += 2.5) part(g, 0.12, 2.2, 0.12, fx, 1.1, -8, METAL);
+    for (const y of [0.4, 1.2, 2.0]) part(g, 20, 0.04, 0.04, 0, y, -8, METAL);
     part(g, 6, 1.8, 0.03, -6, 1.1, -8, 0x5a5a52, 0, 0, 0.05); // sagging fence panel
  
     // Quarantine sign
@@ -2044,12 +1689,11 @@ function buildCheckpoint(x, z) {
     buildCar(x + 7, z + 6, 0.4, OLIVE); // abandoned army jeep (has its own collider)
  
     // Colliders: tents, both halves of the sandbag wall, fence, crates
-    addStaticCollider(5, 2.2, 4, x - 6, z - 4);
-    addStaticCollider(5, 2.2, 4, x + 6, z - 4);
+    addStaticCollider(5, 2.2, 4, x - 5, z - 4);
+    addStaticCollider(5, 2.2, 4, x + 5, z - 4);
     addStaticCollider(7.6, 1.1, 0.6, x - 5.6, z + 3.5);
     addStaticCollider(7.6, 1.1, 0.6, x + 6.0, z + 3.5);
-    addStaticCollider(7, 2.2, 0.2, x - 6.5, z - 8);
-    addStaticCollider(7, 2.2, 0.2, x + 6.5, z - 8);
+    addStaticCollider(20, 2.2, 0.2, x, z - 8);
     addStaticCollider(2, 2, 1.2, x + 8.5, z - 1);
 }
  
@@ -2388,995 +2032,153 @@ function buildChapel(x, z) {
     addStaticCollider(2, 1, 0.8, x, z - 4.2);
 }
  
-
-//------------------------------------------------
-// CITY LAYOUT
-// Every landmark's center. 
-const LAYOUT = {
-    farm:       [-75, 100], // far north-west: where you start, and where the Bloom started
-    checkpoint: [0, 72],    // quarantine line across the north end of Main Street
-    house:      [-27, 27],  // collapsed house
-    houseB:     [-13, 27],  // the intact house next door
-    apartment:  [-20, 13],  // 2 floors, door faces south
-    diner:      [25, 26],
-    pharmacy:   [20, 12],   // door faces south
-    police:     [-20, -17], // 2 floors, armory upstairs
-    gas:        [26, -20],
-    hardware:   [12, -18],
-    bus:        [-20, 40],  // crashed across North Street
-    chapel:     [-62, 15],
-    crash:      [66, -22],
-};
  
-// Position relative to a landmark
-function at(name, dx = 0, dz = 0) {
-    const [x, z] = LAYOUT[name];
-    return [x + dx, z + dz];
-}
- 
-// Roads: [x1, z1, x2, z2] along their center lines (each one runs along x or z)
-const ROAD_W = 8;   // asphalt width
-const WALK_W = 2.5; // sidewalk on each side
-const ROADS = [
-    [0, -45, 0, 85],      // Main Street: tower plaza up to the checkpoint
-    [-40, -36, -40, 40],  // West Avenue
-    [40, -36, 40, 40],    // East Avenue
-    [-46, 40, 46, 40],    // North Street
-    [-60, 0, 60, 0],      // Center Street, out toward the chapel and the crash site
-    [-46, -36, 46, -36],  // South Street
-];
- 
-const FLOOR_H = 3.6;               // height of one story
-const UPPER_Y = FLOOR_H + 0.125;   // top of an upper floor (where you stand)
- 
- 
-//------------------------------------------------
-// Roads, sidewalks and the tower plaza
-function buildRoads() {
-    const g = new THREE.Group();
-    const ASPHALT = 0x3a3632;
-    const WALK = 0x8a8478;
-    const LINE = 0x9a8a4a;
-    const CRACK = 0x2a2724;
- 
-    const half = ROAD_W / 2;
-    const corridor = half + WALK_W;
- 
-    ROADS.forEach(([x1, z1, x2, z2], i) => {
-        const alongX = z1 === z2;
-        const a = alongX ? Math.min(x1, x2) : Math.min(z1, z2);
-        const b = alongX ? Math.max(x1, x2) : Math.max(z1, z2);
-        const fixed = alongX ? z1 : x1;
-        const len = b - a + ROAD_W;
-        const mid = (a + b) / 2;
-        const y = 0.02 + i * 0.002; // tiny height difference so crossings don't flicker
- 
-        // asphalt
-        if (alongX) part(g, len, 0.04, ROAD_W, mid, y, fixed, ASPHALT);
-        else part(g, ROAD_W, 0.04, len, fixed, y, mid, ASPHALT);
- 
-        // where other roads cross this one (no sidewalk or center line there)
-        const crossings = ROADS.filter((r, j) => j !== i && (r[1] === r[3]) !== alongX)
-            .map((r) => (alongX ? r[0] : r[1]))
-            .filter((c) => c >= a - 1 && c <= b + 1);
-        const blocked = (t, pad) => crossings.some((c) => Math.abs(t - c) < half + pad);
- 
-        // sidewalks on both sides, in 2 m pieces so they can skip the crossings
-        for (let t = a - half; t < b + half; t += 2) {
-            if (blocked(t + 1, 0)) continue;
-            for (const side of [-1, 1]) {
-                const off = fixed + side * (half + WALK_W / 2);
-                if (alongX) part(g, 2, 0.12, WALK_W, t + 1, 0.06, off, WALK);
-                else part(g, WALK_W, 0.12, 2, off, 0.06, t + 1, WALK);
-            }
-        }
- 
-        // faded, dashed center line
-        for (let t = a; t < b; t += 5) {
-            if (blocked(t, 1.5) || Math.random() < 0.25) continue;
-            if (alongX) part(g, 2.2, 0.01, 0.18, t, y + 0.021, fixed, LINE);
-            else part(g, 0.18, 0.01, 2.2, fixed, y + 0.021, t, LINE);
-        }
- 
-        // cracks and potholes
-        for (let k = 0; k < len / 10; k++) {
-            const t = a + Math.random() * (b - a);
-            const o = (Math.random() - 0.5) * (ROAD_W - 1);
-            const w = 0.4 + Math.random() * 1.4;
-            if (alongX) part(g, w, 0.01, 0.15 + Math.random() * 0.5, t, y + 0.022, fixed + o, CRACK, 0, Math.random(), 0);
-            else part(g, 0.15 + Math.random() * 0.5, 0.01, w, fixed + o, y + 0.022, t, CRACK, 0, Math.random(), 0);
-        }
- 
-        // keep trees and rocks off the road
-        if (alongX) reserve(a - corridor, fixed - corridor, b + corridor, fixed + corridor);
-        else reserve(fixed - corridor, a - corridor, fixed + corridor, b + corridor);
-    });
- 
-    // Cracked concrete plaza in front of the radio tower
-    part(g, 24, 0.05, 18, 0, 0.03, -47, 0x77706a);
-    for (let k = 0; k < 14; k++) {
-        part(g, 0.2 + Math.random() * 0.4, 0.01, 1 + Math.random() * 2,
-            (Math.random() - 0.5) * 22, 0.06, -47 + (Math.random() - 0.5) * 16, 0x4a4540, 0, Math.random() * 3, 0);
-    }
- 
-    scene.add(g);
-    mergeGroup(g);
-}
- 
-// Dirt path from the farm (where you start) to the checkpoint at the top of Main Street
-const PATH_POINTS = [[-63, 101], [-52, 97], [-38, 93], [-24, 91], [-11, 89], [0, 88]];
- 
-function buildDirtPath() {
-    const g = new THREE.Group();
-    const DIRT = 0x6b5038;
-    const DARK = 0x5a4430;
-    for (let i = 0; i < PATH_POINTS.length - 1; i++) {
-        const [x1, z1] = PATH_POINTS[i];
-        const [x2, z2] = PATH_POINTS[i + 1];
-        const len = Math.hypot(x2 - x1, z2 - z1);
-        const rot = Math.atan2(x2 - x1, z2 - z1);
-        part(g, 3.2, 0.03, len + 1.5, (x1 + x2) / 2, 0.015, (z1 + z2) / 2, DIRT, 0, rot, 0);
-        // wheel ruts and stones
-        part(g, 0.5, 0.01, len, (x1 + x2) / 2, 0.035, (z1 + z2) / 2, DARK, 0, rot, 0);
-        for (let k = 0; k < 4; k++) {
-            const t = Math.random();
-            const side = (Math.random() < 0.5 ? -1 : 1) * (1.8 + Math.random() * 0.6);
-            const sx = x1 + (x2 - x1) * t + Math.cos(rot) * side;
-            const sz = z1 + (z2 - z1) * t - Math.sin(rot) * side;
-            part(g, 0.3, 0.2, 0.25, sx, 0.1, sz, 0x6e6258, 0.2, Math.random() * 3, 0.1);
-        }
-        reserve(Math.min(x1, x2) - 2, Math.min(z1, z2) - 2, Math.max(x1, x2) + 2, Math.max(z1, z2) + 2);
-    }
-    // a few broken fence posts beside the first stretch
-    for (let k = 0; k < 6; k++) {
-        const x = -60 + k * 4;
-        part(g, 0.12, 1.0 - Math.random() * 0.4, 0.12, x, 0.45, 102.3 - k * 1.45, 0x594638, (Math.random() - 0.5) * 0.3, 0, (Math.random() - 0.5) * 0.3);
-    }
-    scene.add(g);
-    mergeGroup(g);
-}
-
-//------------------------------------------------
-// Adds street lights, traffic lights, trash and abandoned cars.
-const lamps = []; // Stores working lamps for the flickering effect.
-
-// Adds a street lamp.
-// (toX, toZ): which way the arm reaches, toward the road
-function buildLamp(g, x, z, toX, toZ, lit = false) {
-    const POLE = 0x4a4844;
-    part(g, 0.16, 5.6, 0.16, x, 2.8, z, POLE);
-    part(g, 0.35, 0.3, 0.35, x, 0.15, z, POLE);
-    // Positions the arm over the road.
-    const ax = toX;
-    const az = toZ;
-    const armDir = Math.atan2(-toZ, toX);
-    part(g, 1.6, 0.1, 0.1, x + ax * 0.75, 5.55, z + az * 0.75, POLE, 0, armDir, 0);
-    const head = new THREE.Mesh(
-        new THREE.BoxGeometry(0.6, 0.18, 0.35),
-        new THREE.MeshStandardMaterial({
-            color: lit ? 0xffe0a0 : 0x2f2d2a,
-            emissive: lit ? 0xffc870 : 0x000000,
-            emissiveIntensity: lit ? 0.9 : 0,
-        })
-    );
-    head.position.set(x + ax * 1.5, 5.45, z + az * 1.5);
-    head.rotation.y = armDir;
-    g.add(head);
-    addStaticCollider(0.25, 5.6, 0.25, x, z);
- 
-    if (lit) {
-        const light = new THREE.PointLight(0xffd08a, 6, 16);
-        light.position.set(x + ax * 1.5, 5.2, z + az * 1.5);
-        scene.add(light);
-        lamps.push({ light, phase: Math.random() * 10 });
-    }
-}
- 
-function buildStreetDetails() {
-    const g = new THREE.Group();
-    const edge = ROAD_W / 2 + WALK_W - 0.5; // Keeps lamps near the sidewalk edge
- 
-    // Street lamps along Main Street, alternating sides (arms point toward the road)
-    [[-26, 1], [-12, -1], [14, 1], [28, -1], [54, 1], [64, -1]].forEach(([z, side], i) => {
-        buildLamp(g, side * edge, z, -side, 0, i === 2);
-    });
-    // Street lamps along Center Street.
-    [[-52, 1], [-26, -1], [-14, 1], [14, -1], [26, 1], [52, -1]].forEach(([x, side], i) => {
-        buildLamp(g, x, side * edge, 0, -side, i === 4);
-    });
-    // A few lamps along the north and south roads
-    buildLamp(g, -28, 40 - edge, 0, 1);
-    buildLamp(g, 22, 40 + edge, 0, -1, true);
-    buildLamp(g, -16, -36 + edge, 0, -1);
-    buildLamp(g, 18, -36 - edge, 0, 1);
- 
-    // Traffic light at the Main and Center Street intersection
-    const POLE = 0x3f3d3a;
-    part(g, 0.2, 5, 0.2, edge, 2.5, edge, POLE);
-    part(g, 3.2, 0.12, 0.12, edge - 1.5, 4.9, edge, POLE);
-    part(g, 0.35, 0.9, 0.3, edge - 2.8, 4.45, edge, 0x2a2826);
-    for (const [ly, c] of [[4.75, 0x4a1a1a], [4.45, 0x4a3a1a], [4.15, 0x1a3a1a]]) {
-        part(g, 0.2, 0.2, 0.05, edge - 2.8, ly, edge + 0.16, c);
-    }
-    addStaticCollider(0.3, 5, 0.3, edge, edge);
-    // A second traffic light lying in the road
-    part(g, 0.2, 5, 0.2, -edge - 1.5, 0.15, -edge + 1, POLE, 0, 0.6, Math.PI / 2);
- 
-    // Trash bags, newspapers and junk along the sidewalks
-    const JUNK = [0x2a2a2a, 0x3a3a2e, 0x5a5048, 0xc8c0a8];
-    for (let k = 0; k < 40; k++) {
-        const r = ROADS[k % ROADS.length];
-        const alongX = r[1] === r[3];
-        const t = (alongX ? Math.min(r[0], r[2]) : Math.min(r[1], r[3])) + Math.random() * Math.abs(alongX ? r[2] - r[0] : r[3] - r[1]);
-        const off = (Math.random() < 0.5 ? -1 : 1) * (ROAD_W / 2 + 0.6 + Math.random() * 1.5);
-        const x = alongX ? t : r[0] + off;
-        const z = alongX ? r[1] + off : t;
-        const c = JUNK[k % JUNK.length];
-        if (c === 0xc8c0a8) part(g, 0.4, 0.01, 0.3, x, 0.13, z, c, 0, Math.random() * 3, 0); // newspaper
-        else part(g, 0.5, 0.4, 0.45, x, 0.32, z, c, 0.1, Math.random() * 3, 0.1);           // trash bag
-    }
- 
-    scene.add(g);
-    mergeGroup(g);
-    obstacles.push(g);
- 
-    // Abandoned cars along the streets (props: barrels can throw them around)
-    buildCar(2.6, 20, Math.PI / 2 + 0.1, 0x5a6a70);
-    buildCar(-2.6, 58, Math.PI / 2 - 0.2, 0x6a5a4a, true);
-    buildCar(2.4, -22, Math.PI / 2, 0x7a4a3a);
-    buildCar(-30, -2.4, 0.05, 0x55604a);
-    buildCar(32, 2.5, -0.1, 0x6a5a4a, true);
-    buildCar(50, -2, 0.3, 0x5a5a68);
-    buildCar(14, 42.5, 0, 0x7a6a4a);
-    buildCar(-18, -34, 0.1, 0x4a5a6a);
-    buildCar(24, -38, -0.2, 0x6a3a3a, true);
-    buildCar(-42.4, 22, Math.PI / 2, 0x5a6a50);
-    buildCar(42.5, -12, Math.PI / 2 + 0.2, 0x7a5a4a);
-    buildCar(-24, -8.5, 0, 0x2a3a5a); // police cruiser out front
-}
- 
-function updateCity(time) {
-    // Makes the working street lamps flicker.
-    for (const l of lamps) {
-        const f = Math.sin(time * 13 + l.phase) + Math.sin(time * 31 + l.phase * 2);
-        l.light.intensity = f > 1.5 ? 0.5 : 6;
-    }
-}
- 
- 
-//------------------------------------------------
-// Furniture used to fill the buildings
-const WOOD = 0x6b5238;
-const DARK_WOOD = 0x4a3a2c;
-const METAL = 0x6d6a60;
-const ITEM_COLORS = [0x8a3a2a, 0x3a5a7a, 0xa08a3a, 0x5a6a50, 0xc8c0a0, 0x6a4a6a];
-
-// Creates a table
-function fTable(b, lx, lz, y0 = 0, w = 1.6, d = 0.9, color = WOOD) {
-    b.box(w, 0.08, d, lx, y0 + 0.78, lz, color);
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
-        b.box(0.08, 0.76, 0.08, lx + sx * (w / 2 - 0.1), y0 + 0.38, lz + sz * (d / 2 - 0.1), color);
-    }
-    b.block(w, 0.82, d, lx, y0 + 0.41, lz);
-}
-
-// Creates a chair, with an option to knock it over
-function fChair(b, lx, lz, y0 = 0, rot = 0, knocked = false) {
-    if (knocked) {
-        b.box(0.45, 0.06, 0.45, lx, y0 + 0.22, lz, DARK_WOOD, 1.4, rot, 0);
-        b.box(0.45, 0.5, 0.06, lx + 0.2, y0 + 0.05, lz, DARK_WOOD, 0, rot, 1.5);
-        return;
-    }
-    b.box(0.45, 0.06, 0.45, lx, y0 + 0.45, lz, DARK_WOOD, 0, rot, 0);
-    b.box(0.45, 0.5, 0.06, lx - Math.sin(rot) * 0.2, y0 + 0.72, lz - Math.cos(rot) * 0.2, DARK_WOOD, 0, rot, 0);
-    for (const sx of [-0.18, 0.18]) for (const sz of [-0.18, 0.18]) {
-        b.box(0.05, 0.45, 0.05, lx + sx, y0 + 0.22, lz + sz, DARK_WOOD);
-    }
-}
- 
-// Creates a shelf with randomly placed items
-function fShelf(b, lx, lz, y0 = 0, len = 2.4, alongX = true, h = 2.0) {
-    const w = alongX ? len : 0.5;
-    const d = alongX ? 0.5 : len;
-    for (const s of [-1, 1]) {
-        b.box(alongX ? 0.06 : 0.5, h, alongX ? 0.5 : 0.06, lx + (alongX ? s * len / 2 : 0), y0 + h / 2, lz + (alongX ? 0 : s * len / 2), METAL);
-    }
-    for (const sy of [0.1, 0.75, 1.4, h - 0.05]) {
-        b.box(w, 0.04, d, lx, y0 + sy, lz, METAL);
-        if (sy > h - 0.1) continue;
-        // stuff on the shelf
-        for (let t = -len / 2 + 0.25; t < len / 2 - 0.2; t += 0.3 + Math.random() * 0.25) {
-            if (Math.random() < 0.3) continue;
-            const ih = 0.15 + Math.random() * 0.3;
-            const c = ITEM_COLORS[Math.floor(Math.random() * ITEM_COLORS.length)];
-            b.box(0.18, ih, 0.2, lx + (alongX ? t : 0), y0 + sy + 0.02 + ih / 2, lz + (alongX ? 0 : t), c);
-        }
-    }
-    b.block(w, h, d, lx, y0 + h / 2, lz);
-}
- 
-// Creates a bed with a mattress, blanket and pillow
-function fBed(b, lx, lz, y0 = 0, alongX = true, blanket = 0x5a4a5a) {
-    const w = alongX ? 2.0 : 1.0;
-    const d = alongX ? 1.0 : 2.0;
-    b.box(w, 0.3, d, lx, y0 + 0.2, lz, DARK_WOOD);             // frame
-    b.box(w - 0.1, 0.18, d - 0.1, lx, y0 + 0.44, lz, 0xb8b0a0); // mattress
-    b.box(alongX ? w * 0.6 : d - 0.1, 0.06, alongX ? d - 0.1 : w * 0.6,
-        lx + (alongX ? 0.3 : 0), y0 + 0.55, lz + (alongX ? 0 : 0.3), blanket);
-    b.box(alongX ? 0.4 : 0.6, 0.12, alongX ? 0.6 : 0.4,
-        lx - (alongX ? w / 2 - 0.3 : 0), y0 + 0.58, lz - (alongX ? 0 : d / 2 - 0.3), 0xd0c8b8); // pillow
-    b.block(w, 0.55, d, lx, y0 + 0.27, lz);
-}
- 
-// Creates a storage cabinet
-function fCabinet(b, lx, lz, y0 = 0, color = METAL) {
-    b.solid(0.6, 1.3, 0.5, lx, y0 + 0.65, lz, color);
-    for (const dy of [0.35, 0.75, 1.1]) b.box(0.4, 0.04, 0.02, lx, y0 + dy, lz + 0.26, 0x2a2a2a);
-}
- 
-// Creates a couch
-function fCouch(b, lx, lz, y0 = 0, alongX = true, color = 0x5a4a3a) {
-    const w = alongX ? 2.2 : 0.9;
-    const d = alongX ? 0.9 : 2.2;
-    b.solid(w, 0.45, d, lx, y0 + 0.22, lz, color);
-    if (alongX) b.box(w, 0.6, 0.2, lx, y0 + 0.65, lz - 0.35, color);
-    else b.box(0.2, 0.6, d, lx - 0.35, y0 + 0.65, lz, color);
-}
- 
-// Creates a counter
-function fCounter(b, lx, lz, y0 = 0, len = 3, alongX = true, color = WOOD) {
-    const w = alongX ? len : 0.7;
-    const d = alongX ? 0.7 : len;
-    b.solid(w, 1.0, d, lx, y0 + 0.5, lz, color);
-    b.box(w + 0.1, 0.06, d + 0.1, lx, y0 + 1.03, lz, 0x8a8478);
-}
-
-// Adds a few scattered crates
-function fCrates(b, lx, lz, y0 = 0) {
-    b.solid(1, 1, 1, lx, y0 + 0.5, lz, 0x7a6040);
-    b.box(0.9, 0.9, 0.9, lx + 0.1, y0 + 1.45, lz - 0.05, 0x6b5238, 0, 0.3, 0);
-    b.box(0.8, 0.6, 0.7, lx + 1.0, y0 + 0.3, lz + 0.2, 0x7a6040, 0, 0.5, 0);
-}
- 
-// Adds random debris to the floor
-function fDebris(b, lx, lz, y0 = 0, n = 6) {
-    for (let k = 0; k < n; k++) {
-        b.box(0.2 + Math.random() * 0.5, 0.05 + Math.random() * 0.15, 0.2 + Math.random() * 0.4,
-            lx + (Math.random() - 0.5) * 2, y0 + 0.05, lz + (Math.random() - 0.5) * 2,
-            [0x6e655a, 0x4a4540, 0xc8c0a8][k % 3], Math.random() * 0.3, Math.random() * 3, 0);
-    }
-}
- 
- 
-//------------------------------------------------
-// Creates a two-story building with stairs connecting both floors
-function buildMultiStory(x, z, o) {
-    const b = makeBuilder(x, z, o.flip);
-    const { w, d } = o;
-    const FH = FLOOR_H;
-    const H = FH * 2 + 0.2;
-    const T = 0.3;
-    const WALL = o.wall ?? 0x8f8374;
-    const TRIM = o.trim ?? 0x5a4f44;
-    const FLOOR = o.floor ?? 0x5e574e;
-    const GLASS = 0x3e4a48;
-    const DARK = 0x1e1c1a;
-    const ROOF = 0x3f3a36;
- 
-    // Builds the walls and doorway
-    const DOOR = 2.2;
-    const DOOR_H = 2.7;
-    const seg = (w - DOOR) / 2;
-    b.solid(w, H, T, 0, H / 2, -d / 2, WALL);                                   // back
-    b.solid(T, H, d, -w / 2, H / 2, 0, WALL);                                   // left
-    b.solid(T, H, d, w / 2, H / 2, 0, WALL);                                    // right
-    b.solid(seg, FH, T, -(DOOR / 2 + seg / 2), FH / 2, d / 2, WALL);            // front, left of door
-    b.solid(seg, FH, T, DOOR / 2 + seg / 2, FH / 2, d / 2, WALL);               // front, right of door
-    b.solid(DOOR, FH - DOOR_H, T, 0, DOOR_H + (FH - DOOR_H) / 2, d / 2, WALL);  // over the door
-    b.solid(w, H - FH, T, 0, FH + (H - FH) / 2, d / 2, WALL);                   // front, upper floor
- 
-    // Adds windows to both floors, some smashed
-    for (const y of [1.8, FH + 1.8]) {
-        for (let wx = -w / 2 + 1.6; wx <= w / 2 - 1.6; wx += 2.6) {
-            if (y < FH && Math.abs(wx) < DOOR / 2 + 0.9) continue; // not over the door
-            for (const side of [1, -1]) {
-                const c = Math.random() < 0.35 ? DARK : GLASS;
-                b.box(1.3, 1.1, 0.06, wx, y, side * (d / 2 + 0.17), c);
-                b.box(1.3, 1.1, 0.06, wx, y, side * (d / 2 - 0.17), c);
-            }
-            b.box(1.5, 0.1, 0.14, wx, y - 0.6, d / 2 + 0.22, TRIM); // sill
-        }
-        for (let wz = -d / 2 + 1.6; wz <= d / 2 - 1.6; wz += 2.6) {
-            for (const side of [1, -1]) {
-                const c = Math.random() < 0.35 ? DARK : GLASS;
-                b.box(0.06, 1.1, 1.3, side * (w / 2 + 0.17), y, wz, c);
-                b.box(0.06, 1.1, 1.3, side * (w / 2 - 0.17), y, wz, c);
-            }
-        }
-    }
-    // Adds exterior trim and the roof
-    b.box(w + 0.1, 0.3, 0.06, 0, FH, d / 2 + 0.18, TRIM);
-    b.box(w + 0.1, 0.3, 0.06, 0, FH, -d / 2 - 0.18, TRIM);
-    b.box(0.06, 0.3, d + 0.1, w / 2 + 0.18, FH, 0, TRIM);
-    b.box(0.06, 0.3, d + 0.1, -w / 2 - 0.18, FH, 0, TRIM);
-    b.box(DOOR + 0.4, 0.2, 0.1, 0, DOOR_H + 0.1, d / 2 + 0.2, TRIM);
-    b.solid(w + 0.4, 0.3, d + 0.4, 0, H + 0.15, 0, ROOF);
-    b.box(w + 0.4, 0.5, 0.2, 0, H + 0.55, d / 2 + 0.1, TRIM);
-    b.box(w + 0.4, 0.5, 0.2, 0, H + 0.55, -d / 2 - 0.1, TRIM);
-    b.box(0.2, 0.5, d + 0.4, w / 2 + 0.1, H + 0.55, 0, TRIM);
-    b.box(0.2, 0.5, d + 0.4, -w / 2 - 0.1, H + 0.55, 0, TRIM);
- 
-    // Ground floor
-    b.box(w - T, 0.04, d - T, 0, 0.02, 0, FLOOR);
- 
-    // Builds stairs along the left wall
-    const SW = 1.6;               // stair width (brutes don't fit; they guard the bottom)
-    const SL = 6.4;               // long enough to stay under 30 degrees
-    const sx = -w / 2 + T / 2 + SW / 2 + 0.05;
-    const sz0 = d / 2 - 1.4;      // first step
-    const szTop = sz0 - SL;       // last step
-    const holeX = sx + SW / 2 + 0.05;
-    const area = { x1: x - w / 2, x2: x + w / 2, z1: z - d / 2, z2: z + d / 2 };
-    const steps = Math.round(FH / 0.3);
-    for (let i = 0; i < steps; i++) {
-        const h = (i + 1) * (FH / steps);
-        b.box(SW, h, SL / steps, sx, h / 2, sz0 - (i + 0.5) * (SL / steps), 0x6e655a);
-    }
-    // Adds a ramp for smoother movement up the stairs
-    const angle = Math.atan2(FH, SL) * (o.flip ? -1 : 1);
-    const rampMid = b.at(sx, sz0 - SL / 2);
-    addSolid(SW, 0.2, Math.hypot(FH, SL) + 0.3, rampMid.x, FH / 2 - 0.05, rampMid.z, angle, 0);
-    stairways.push({
-        area,
-        floorY: FH,
-        bottom: b.at(sx, sz0 + 0.7),
-        top: b.at(sx, szTop - 1.6),   // on the landing, a little back from the top step
-        doorIn: b.at(0, d / 2 - 1.2),
-        doorOut: b.at(0, d / 2 + 1.6),
-    });
- 
-    // Upper floor and stair railing
-    const SLAB = 0.25;
-    const inL = -w / 2 + T / 2;
-    const inR = w / 2 - T / 2;
-    const inB = -d / 2 + T / 2;
-    b.solid(inR - holeX, SLAB, d - T, (holeX + inR) / 2, FH, 0, FLOOR);
-    b.solid(holeX - inL, SLAB, szTop - inB, (inL + holeX) / 2, FH, (szTop + inB) / 2, FLOOR);
-    b.solid(0.08, 1.0, SL + 1.2, holeX + 0.04, FH + 0.62, sz0 - SL / 2 + 0.6, TRIM);
- 
-    o.ground?.(b);
-    o.upper?.(b);
-    b.finish();
-    reserve(x - w / 2 - 1, z - d / 2 - 1, x + w / 2 + 1, z + d / 2 + 1);
-    return b;
-}
- 
-// Creates a one-story building with optional storefront windows and a pitched roof
-function buildShop(x, z, o) {
-    const b = makeBuilder(x, z, o.flip);
-    const { w, d } = o;
-    const H = o.pitched ? 3.4 : 3.6;
-    const T = 0.3;
-    const WALL = o.wall ?? 0xa09684;
-    const TRIM = o.trim ?? 0x5a4f44;
-    const GLASS = 0x4a5a56;
-    const DOOR = 2.0;
-    const seg = (w - DOOR) / 2;
- 
-    b.solid(w, H, T, 0, H / 2, -d / 2, WALL);
-    b.solid(T, H, d, -w / 2, H / 2, 0, WALL);
-    b.solid(T, H, d, w / 2, H / 2, 0, WALL);
-    b.solid(seg, H, T, -(DOOR / 2 + seg / 2), H / 2, d / 2, WALL);
-    b.solid(seg, H, T, DOOR / 2 + seg / 2, H / 2, d / 2, WALL);
-    b.box(DOOR, H - 2.6, T, 0, 2.6 + (H - 2.6) / 2, d / 2, WALL);
-    b.box(w - T, 0.04, d - T, 0, 0.02, 0, o.floor ?? 0x5e574e);
- 
-    if (o.storefront) {
-        for (const s of [-1, 1]) {
-            b.box(seg - 0.6, 1.8, 0.06, s * (DOOR / 2 + seg / 2), 1.7, d / 2 + 0.17, Math.random() < 0.5 ? 0x1e1c1a : GLASS);
-            b.box(seg - 0.6, 0.12, 0.14, s * (DOOR / 2 + seg / 2), 0.75, d / 2 + 0.22, TRIM);
-        }
-    } else {
-        for (const s of [-1, 1]) b.box(1.2, 1.0, 0.06, s * (DOOR / 2 + seg / 2), 1.8, d / 2 + 0.17, GLASS);
-    }
-    for (const s of [-1, 1]) b.box(0.06, 1.0, 1.2, s * (w / 2 + 0.17), 1.8, 0, Math.random() < 0.4 ? 0x1e1c1a : GLASS);
- 
-    if (o.pitched) {
-        const ROOF = o.roof ?? 0x5a3a2e;
-        b.box(w / 2 + 0.6, 0.25, d + 0.8, -w / 4, H + 0.8, 0, ROOF, 0, 0, 0.45);
-        b.box(w / 2 + 0.6, 0.25, d + 0.8, w / 4, H + 0.8, 0, ROOF, 0, 0, -0.45);
-        for (const s of [-1, 1]) {
-            b.box(w - 3, 0.6, T, 0, H + 0.3, s * d / 2, WALL);
-            b.box(w - 5.6, 0.6, T, 0, H + 0.9, s * d / 2, WALL);
-        }
-    } else {
-        b.box(w + 0.4, 0.3, d + 0.4, 0, H + 0.15, 0, o.roof ?? 0x3f3a36);
-    }
-    if (o.sign) {
-        b.box(w * 0.6, 0.7, 0.15, 0, H - 0.25, d / 2 + 0.25, o.sign);
-        b.box(w * 0.5, 0.25, 0.17, 0, H - 0.25, d / 2 + 0.26, 0xd8d0b8);
-    }
- 
-    o.furnish?.(b);
-    b.finish();
-    reserve(x - w / 2 - 1, z - d / 2 - 1, x + w / 2 + 1, z + d / 2 + 1);
-    return b;
-}
- 
- 
-//------------------------------------------------
-// City buildings
- 
-// POLICE STATION: front desk, filing cabinets and a holding cell downstairs,
-// the armory (and the shotgun) upstairs
-function buildPolice(x, z) {
-    buildMultiStory(x, z, {
-        w: 16, d: 12, wall: 0x7a8088, trim: 0x2a3a5a, floor: 0x5a5a5a,
-        ground(b) {
-            fCounter(b, 3, 3, 0, 4, true, 0x4a4a52);
-            fTable(b, -3.5, -0.5, 0, 1.6, 0.9, 0x5a5048);
-            fChair(b, -3.5, 0.3, 0, Math.PI);
-            fChair(b, -2.2, -1.5, 0, 0.8, true);
-            for (const cx of [1.5, 2.2, 2.9]) fCabinet(b, cx, -5.5, 0);
-            fCouch(b, 7.3, 1, 0, false, 0x3a3a44);
-            // holding cell in the back right corner, door hanging open
-            const BAR = 0x4a4a4a;
-            for (let bz = -5.7; bz <= -2.4; bz += 0.3) b.box(0.05, 2.6, 0.05, 4.2, 1.3, bz, BAR);
-            for (let bx = 4.2; bx <= 7.8; bx += 0.3) if (bx < 5.0 || bx > 6.0) b.box(0.05, 2.6, 0.05, bx, 1.3, -2.2, BAR);
-            b.box(1.0, 2.6, 0.05, 5.8, 1.3, -1.7, BAR, 0, 0.9, 0);
-            b.block(0.1, 2.6, 3.6, 4.2, 1.3, -4.0);
-            b.block(0.8, 2.6, 0.1, 4.6, 1.3, -2.2);
-            b.block(1.85, 2.6, 0.1, 6.95, 1.3, -2.2);
-            fBed(b, 6.6, -5.2, 0, true, 0x4a4a52);
-            fDebris(b, 1, 1.5, 0, 5);
-        },
-        upper(b) {
-            const y = UPPER_Y;
-            for (let lx = 0; lx <= 5; lx += 0.75) b.solid(0.7, 2.0, 0.5, lx, y + 1.0, -5.5, 0x4a5a4a); // lockers
-            // empty weapon racks on the right wall
-            for (const rz of [-2.5, 0, 2.5]) {
-                b.box(0.1, 1.4, 2.0, 7.7, y + 1.3, rz, DARK_WOOD);
-                for (let k = -0.7; k <= 0.7; k += 0.35) b.box(0.15, 0.05, 0.05, 7.6, y + 0.9, rz + k, METAL);
-            }
-            fTable(b, 2, -1, y, 2.0, 1.0, 0x5a5048);
-            fChair(b, 2, 0, y, Math.PI, true);
-            fCrates(b, 5, 4, y);
-            fBed(b, -3, 4.5, y, true, 0x4a5a4a); // a cot someone slept on
-            fDebris(b, -2, -3, y, 4);
-        },
-    });
-}
- 
-// APARTMENT BLOCK: lobby with mailboxes downstairs, bedrooms upstairs
-function buildApartment(x, z) {
-    buildMultiStory(x, z, {
-        w: 14, d: 12, flip: true, wall: 0x9a8270, trim: 0x5a4434, floor: 0x5e5048,
-        ground(b) {
-            b.solid(0.4, 1.6, 3, 6.5, 0.8, 2, 0x6a6a60); // mailboxes
-            for (let mz = 0.8; mz <= 3.2; mz += 0.4) for (const my of [0.5, 0.9, 1.3]) b.box(0.05, 0.25, 0.3, 6.28, my, mz, 0x3a3a34);
-            fCouch(b, 3, -4.8, 0, true, 0x6a4a3a);
-            fTable(b, 3, -3, 0, 1.2, 0.7, DARK_WOOD);
-            fChair(b, 1.5, -1.2, 0, 0.5, true);
-            fCrates(b, -3.5, -4.5, 0);
-            fDebris(b, 2, 1, 0, 6);
-        },
-        upper(b) {
-            const y = UPPER_Y;
-            fBed(b, 3, -4.8, y, true, 0x5a4a6a);
-            fBed(b, 6, 1.5, y, false, 0x4a5a6a);
-            fShelf(b, 6.7, -2.5, y, 2.0, false, 1.6);
-            fTable(b, -1.5, -3, y, 1.4, 0.9, DARK_WOOD);
-            fChair(b, -1.5, -2.1, y, Math.PI);
-            fCouch(b, 1, 3.5, y, true, 0x5a3a3a);
-            fDebris(b, 2, -1, y, 4);
-        },
-    });
-}
- 
-// PHARMACY: aisles of shelves and a counter at the back. Door faces south.
-function buildPharmacy(x, z) {
-    buildShop(x, z, {
-        w: 12, d: 8, flip: true, storefront: true, sign: 0x3a6a5a, wall: 0xb0a898,
-        furnish(b) {
-            fShelf(b, -2.5, 0.6, 0, 3.5, true, 1.8);
-            fShelf(b, -2.5, -1.6, 0, 3.5, true, 1.8);
-            fShelf(b, 3.2, 0.6, 0, 2.6, true, 1.8);
-            fCounter(b, 2.5, -3.0, 0, 4, true, 0xc8c0b0);
-            b.box(0.4, 0.3, 0.35, 3.2, 1.2, -3.0, 0x2a2a2a); // cash register
-            fDebris(b, 0.5, 2, 0, 6);
-        },
-    });
-}
- 
-// HARDWARE STORE: tools on the walls, workbench at the back (the machete is on it)
-function buildHardware(x, z) {
-    buildShop(x, z, {
-        w: 8, d: 8, storefront: true, sign: 0x8a5a2a, wall: 0x9a8a74,
-        furnish(b) {
-            fShelf(b, -2.7, 0.2, 0, 3.4, false, 2.0);
-            fShelf(b, 2.7, 0.8, 0, 2.6, false, 2.0);
-            fCounter(b, 1.3, -3.25, 0, 3.2, true, DARK_WOOD); // workbench
-            // tools hanging on the back wall
-            for (let tx = -1.5; tx <= 2.5; tx += 0.6) {
-                b.box(0.05, 0.6 + Math.random() * 0.3, 0.05, tx, 2.0, -3.75, 0x5a5048);
-                b.box(0.25, 0.1, 0.06, tx, 2.3, -3.75, METAL);
-            }
-            fCrates(b, -2.2, -3, 0);
-            for (let k = 0; k < 5; k++) b.box(0.25, 0.3, 0.25, 0.2 + k * 0.32, 0.15, 2.8, ITEM_COLORS[k]); // paint cans
-        },
-    });
-}
- 
-// The intact house next to the collapsed one
-function buildHouseB(x, z) {
-    buildShop(x, z, {
-        w: 8, d: 7, pitched: true, wall: 0xa89878, roof: 0x4a3a32,
-        furnish(b) {
-            fBed(b, -2.6, -2.4, 0, true, 0x6a5a4a);
-            fTable(b, 1.6, -1.2, 0, 1.4, 0.9, WOOD);
-            fChair(b, 1.6, -0.3, 0, Math.PI);
-            fChair(b, 2.6, -1.4, 0, 0, true);
-            fCouch(b, 2.2, 2.2, 0, true, 0x5a4a3a);
-            fShelf(b, -3.55, 1.4, 0, 1.6, false, 1.6);
-        },
-    });
-}
- 
-// Furniture for the older buildings (gas station shop, collapsed house, farmhouse)
-function furnishOldBuildings() {
-    // Gas station shop
-    let b = makeBuilder(...LAYOUT.gas);
-    fShelf(b, -2.4, -0.2, 0, 2.6, false, 1.8);
-    fShelf(b, -1.2, -3.3, 0, 2.2, true, 2.0); // drinks cooler along the back
-    fCounter(b, 2.6, 2.3, 0, 1.6, true, 0x5a5048);
-    b.box(0.4, 0.3, 0.35, 2.6, 1.2, 2.3, 0x2a2a2a);
-    fDebris(b, 0, 2.5, 0, 4);
-    b.finish();
- 
-    // Collapsed house: what's left of someone's home
-    b = makeBuilder(...LAYOUT.house);
-    fTable(b, 2.0, 0.3, 0, 1.4, 0.9, DARK_WOOD);
-    fChair(b, 2.8, 1.3, 0, 0, true);
-    fBed(b, -2.3, -2.7, 0, true, 0x5a4a3a);
-    b.box(2.4, 1.8, 0.4, 1.6, 0.6, -3.2, METAL, 0.9, 0, 0.1); // shelf that fell over
-    fDebris(b, 1.5, -1.5, 0, 6);
-    b.finish();
- 
-    // Farmhouse kitchen and bedroom
-    b = makeBuilder(...LAYOUT.farm);
-    fTable(b, -1, 0, 0, 1.6, 1.0, WOOD);
-    fChair(b, -1, -0.8, 0, 0);
-    fChair(b, -1, 0.8, 0, Math.PI);
-    b.solid(0.8, 0.9, 0.7, -3.3, 0.45, -2.6, 0x3a3a3a); // stove
-    fBed(b, -2.6, 2.4, 0, true, 0x7a5a3a);
-    fShelf(b, 1.5, -3.1, 0, 2.0, true, 1.6);
-    b.finish();
-}
- 
- 
-//------------------------------------------------
-// Nature: dead trees and rocks, kept off roads and out of buildings
-function buildDeadTree(g, x, z, s = 1) {
-    const BARK = 0x3a2e24;
-    const h = (4 + Math.random() * 2.5) * s;
-    const lean = (Math.random() - 0.5) * 0.15;
-    const trunk = new THREE.Group();
-    trunk.position.set(x, 0, z);
-    trunk.rotation.set(lean, Math.random() * 6, -lean);
-    g.add(trunk);
-    part(trunk, 0.4 * s, h, 0.4 * s, 0, h / 2, 0, BARK);
-    part(trunk, 0.7 * s, 0.3, 0.7 * s, 0, 0.15, 0, BARK); // root flare
- 
-    const branches = 3 + Math.floor(Math.random() * 3);
-    for (let i = 0; i < branches; i++) {
-        const pivot = new THREE.Group();
-        pivot.position.y = h * (0.45 + Math.random() * 0.5);
-        pivot.rotation.y = Math.random() * Math.PI * 2;
-        trunk.add(pivot);
-        const arm = new THREE.Group();
-        arm.rotation.z = 0.5 + Math.random() * 0.6;
-        pivot.add(arm);
-        const len = (1.2 + Math.random() * 1.4) * s;
-        part(arm, len, 0.14 * s, 0.14 * s, len / 2, 0, 0, BARK);
-        // a twig off the end
-        const twig = new THREE.Group();
-        twig.position.x = len;
-        twig.rotation.z = 0.5;
-        arm.add(twig);
-        part(twig, len * 0.5, 0.08 * s, 0.08 * s, len * 0.25, 0, 0, BARK);
-    }
-    addStaticCollider(0.45 * s, h, 0.45 * s, x, z);
-    reserve(x - 1, z - 1, x + 1, z + 1);
-}
- 
-function buildNature() {
-    const g = new THREE.Group();
- 
-    // trees in specific spots: yards, along the dirt path, the farm, the chapel
-    const spots = [
-        [-35, 17], [-8, 16], [-33, 8], [-7, 33],                    // residential yards
-        [-56, 104], [-46, 99], [-32, 96], [-18, 94], [-5, 92],     // along the path
-        [-44, 89], [-28, 87], [-14, 85],
-        [-92, 108], [-88, 92], [-60, 112], [-70, 85],              // farm
-        [-70, 22], [-52, 26], [-68, 6],                             // chapel
-        [72, -10], [58, -14], [76, -30],                            // crash site
-        [-50, -20], [-55, -45], [52, 30], [55, 55], [-55, 55], [30, 60], [-25, 62], [25, 70],
-    ];
-    for (const [x, z] of spots) if (isFree(x, z, 0.5)) buildDeadTree(g, x, z, 0.8 + Math.random() * 0.5);
- 
-    // extra random trees in the open outskirts
-    for (let k = 0, placed = 0; k < 400 && placed < 25; k++) {
-        const x = (Math.random() - 0.5) * 240;
-        const z = (Math.random() - 0.5) * 240 + 10;
-        if (Math.abs(x) < 50 && z > -45 && z < 50) continue; // not in the middle of the city
-        if (!isFree(x, z, 3)) continue;
-        buildDeadTree(g, x, z, 0.7 + Math.random() * 0.6);
-        placed++;
-    }
-    scene.add(g);
-    mergeGroup(g);
-    obstacles.push(g);
- 
-    // rocks (visual only)
-    const rocks = new THREE.Group();
-    for (let k = 0, placed = 0; k < 500 && placed < 70; k++) {
-        const x = (Math.random() - 0.5) * 300;
-        const z = (Math.random() - 0.5) * 300;
-        if (!isFree(x, z, 1.5)) continue;
-        const rock = new THREE.Mesh(
-            new THREE.DodecahedronGeometry(Math.random() * 1.2 + 0.3),
-            new THREE.MeshStandardMaterial({ color: 0x6e5a48, flatShading: true })
-        );
-        rock.position.set(x, 0.2, z);
-        rock.rotation.set(Math.random(), Math.random(), Math.random());
-        rocks.add(rock);
-        placed++;
-    }
-    scene.add(rocks);
-    mergeGroup(rocks);
-}
- 
- 
-//------------------------------------------------
-// Skeletons: lying on the ground, or sitting against a wall
-const BONE = 0xd6cdb4;
- 
-function buildSkeleton(x, z, rot = 0, sitting = false, y = 0) {
-    const g = new THREE.Group();
-    if (!sitting) {
-        // lying on its back, head toward -z
-        part(g, 0.22, 0.2, 0.25, 0, 0.1, -0.85, BONE);               // skull
-        part(g, 0.04, 0.04, 0.03, -0.05, 0.16, -0.97, 0x222222);     // eye sockets
-        part(g, 0.04, 0.04, 0.03, 0.05, 0.16, -0.97, 0x222222);
-        part(g, 0.05, 0.05, 0.6, 0, 0.04, -0.4, BONE);               // spine
-        for (let i = 0; i < 5; i++) part(g, 0.34 - i * 0.03, 0.04, 0.03, 0, 0.08, -0.6 + i * 0.07, BONE); // ribs
-        part(g, 0.3, 0.06, 0.14, 0, 0.05, -0.05, BONE);              // pelvis
-        for (const s of [-1, 1]) {
-            part(g, 0.05, 0.05, 0.45, s * 0.1, 0.03, 0.25, BONE, 0, s * 0.08, 0);   // thigh
-            part(g, 0.045, 0.045, 0.42, s * 0.14, 0.03, 0.68, BONE, 0, s * 0.12, 0); // shin
-            part(g, 0.04, 0.04, 0.3, s * 0.24, 0.03, -0.45, BONE, 0, -s * 0.4, 0);   // upper arm
-            part(g, 0.035, 0.035, 0.28, s * 0.3, 0.03, -0.18, BONE, 0, s * 0.25, 0); // forearm
-        }
-    } else {
-        // sitting against a wall (behind it is -z), legs stretched out toward +z
-        part(g, 0.22, 0.22, 0.24, 0, 0.82, -0.05, BONE, 0.3, 0, 0.15); // skull, slumped
-        part(g, 0.04, 0.04, 0.03, -0.05, 0.85, 0.08, 0x222222);
-        part(g, 0.04, 0.04, 0.03, 0.05, 0.85, 0.08, 0x222222);
-        part(g, 0.05, 0.55, 0.05, 0, 0.4, -0.12, BONE, -0.15, 0, 0); // spine
-        for (let i = 0; i < 4; i++) part(g, 0.32 - i * 0.03, 0.03, 0.18, 0, 0.62 - i * 0.08, -0.06, BONE);
-        part(g, 0.3, 0.1, 0.16, 0, 0.06, -0.1, BONE);                 // pelvis
-        for (const s of [-1, 1]) {
-            part(g, 0.05, 0.05, 0.45, s * 0.1, 0.05, 0.15, BONE, 0, s * 0.05, 0);
-            part(g, 0.045, 0.045, 0.42, s * 0.12, 0.04, 0.58, BONE, 0, s * 0.08, 0);
-            part(g, 0.04, 0.3, 0.04, s * 0.2, 0.45, -0.05, BONE, 0, 0, s * 0.2);   // arms hanging down
-            part(g, 0.035, 0.035, 0.28, s * 0.25, 0.12, 0.12, BONE, 0, s * 0.3, 0);
-        }
-    }
-    g.position.set(x, y, z);
-    g.rotation.y = rot;
-    scene.add(g);
-    mergeGroup(g);
-}
- 
-function buildSkeletons() {
-    // Positions are relative to landmarks where it matters, so they move with them
-    buildSkeleton(...at('checkpoint', -3, 6), 0.4);
-    buildSkeleton(...at('checkpoint', 9, -3), 2.0);
-    buildSkeleton(3, 50, 1.2);
-    buildSkeleton(-36, 3, -0.6);
-    buildSkeleton(35, -32, 2.5);
-    buildSkeleton(...at('crash', 3, 4), 0.8);
-    buildSkeleton(...at('chapel', 5.2, -3), 1.0);  // next to the open grave
-    buildSkeleton(...at('farm', -6, 8), -0.5);
-    buildSkeleton(3, -80, 2.2);                     // evac road
-    buildSkeleton(-4, -126, -1.0);                  // landing zone
-    // sitting ones
-    buildSkeleton(...at('diner', -4.9, 2.6), Math.PI / 2, true, 0.5);   // in a diner booth
-    buildSkeleton(...at('police', 6.8, -5.0), 0, true, 0.55);           // on the cell bed
-    buildSkeleton(...at('police', 7.2, 3), -Math.PI / 2, true, UPPER_Y); // upstairs, by the racks
-    buildSkeleton(-13.7, 17.5, -Math.PI / 2, true, UPPER_Y);            // apartment, upstairs bedroom
-    buildSkeleton(...at('houseB', -2.4, -2.4), Math.PI / 2, false, 0.5); // in bed
-}
-
 // LORE: journal pages and records at each new location.
 // They use addSecret, so they count toward the secrets total and give +50 score.
 function buildLoreNotes() {
-    addSecret(...at('farm', 5.5, -1.5), (g) => notePaper(g),
-        'Torn journal page: "Day 1. The corn came up overnight with green veins in every stalk. At night the whole field glows. Dad thinks it\'s beautiful."', 0.2);
+    // Farm porch
+    addSecret(-54.5, 43.5, (g) => notePaper(g, 0.21),
+        'Torn journal page: "Day 1. The corn came up overnight with green veins in every stalk. At night the whole field glows. Dad thinks it\'s beautiful."');
  
-    addSecret(...at('checkpoint', -6, -0.9), (g) => notePaper(g),
-        'Military bulletin: "SECTOR 9 QUARANTINE. The Bloom spreads by spore. Infected hosts are hostile. Evacuation flights suspended until further notice."', 0.79);
+    // Checkpoint field desk
+    addSecret(-55, -34, (g) => notePaper(g, 0.8),
+        'Military bulletin: "SECTOR 9 QUARANTINE. The Bloom spreads by spore. Infected hosts are hostile. Evacuation flights suspended until further notice."');
  
-    addSecret(...at('police', 2, -1.2), (g) => notePaper(g),
-        'Duty log, Officer Reyes: "Day 31. No word from command in a week. I left the shotgun up here in the armory. If you\'re reading this, it\'s yours now."', UPPER_Y + 0.82);
- 
-    addSecret(-21.5, 16, (g) => notePaper(g),
-        'Journal page: "Day 58. We barricaded the stairwell, but they learned to climb. Nowhere is high enough anymore."', UPPER_Y + 0.82);
- 
-    addSecret(...at('diner', -3, -0.8), (g) => notePaper(g),
+    // Diner floor, near the counter
+    addSecret(52, 14.2, (g) => notePaper(g),
         'Journal page: "Day 96. Marcus found us at the diner. Six of us now. He says Tower 9 can still reach the evac channel if we find the parts."');
  
-    addSecret(...at('chapel', 0, -4.2), (g) => notePaper(g),
-        'Journal page: "Day 150. We buried Ellie behind the chapel. Marcus has started coughing. It comes up green."', 1.01);
+    // Chapel altar
+    addSecret(-28, -76.2, (g) => notePaper(g, 1.01),
+        'Journal page: "Day 150. We buried Ellie behind the chapel. Marcus has started coughing. It comes up green."');
  
-    addSecret(...at('crash', -3, 3), (g) => {
+    // Flight recorder near the crashed chopper
+    addSecret(45, -57, (g) => {
         part(g, 0.4, 0.3, 0.5, 0, 0.15, 0, 0xd0661a, 0, 0.5, 0);
         part(g, 0.42, 0.06, 0.52, 0, 0.22, 0, 0x222222, 0, 0.5, 0);
     }, 'Flight recorder: "EVAC-2 to base... spore cloud in the intake... losing power... we\'re going dow—" The recording ends.');
+}
+ 
+ 
+// Husks, nests and supplies at the new locations. Called from spawnEntities()
+// so they come back when the player presses R.
+function spawnOutskirts() {
+    // Checkpoint: the soldiers who didn't make it
+    spawnCluster(-55, -25, [['normal', -58, -22], ['normal', -52, -23], ['runner', -55, -18]]);
+    spawnBarrel(-63, -24);
+    spawnBarrel(-62.2, -23.5);
+    spawnPickup('ammo', -55, -36);
+    spawnPickup('ammo', -53.5, -36);
+ 
+    // Diner: nest in the back booth area, guards in the parking lot
+    spawnNest(59, 15);
+    spawnCluster(46, 15, [['normal', 45, 12], ['normal', 47, 18], ['runner', 42, 15], ['normal', 50, 10]]);
+    spawnPickup('medkit', 54, 16);
+ 
+    // Farm: the very first nest, right in the middle of the field
+    spawnNest(-71, 45);
+    spawnCluster(-62, 45, [['brute', -66, 50], ['normal', -58, 40], ['normal', -66, 40], ['runner', -62, 55]]);
+    spawnPickup('ammo', -54, 46);
+ 
+    // Crashed chopper: a couple of scavengers
+    spawnCluster(48, -60, [['normal', 52, -56], ['runner', 44, -63]]);
+    spawnPickup('medkit', 51, -63);
+ 
+    // Chapel: mourners who never left
+    spawnCluster(-28, -66, [['normal', -26, -64], ['normal', -30, -64], ['normal', -18, -67]]);
+    spawnPickup('ammo', -28, -71);
 }
 
 
 //------------------------------------------------
 // World Building
 function buildStaticWorld() {
-    // Keep trees and rocks out of these areas (buildings reserve their own space too)
-    reserve(...at('gas', -6, -6), ...at('gas', 7, 10));
-    reserve(...at('house', -5, -5), ...at('house', 5, 6));
-    reserve(...at('diner', -16, -5), ...at('diner', 7, 6));
-    reserve(...at('checkpoint', -11, -9), ...at('checkpoint', 11, 9));
-    reserve(...at('farm', -17, -11), ...at('farm', 13, 10));
-    reserve(...at('chapel', -4, -6), ...at('chapel', 14, 10));
-    reserve(...at('crash', -8, -8), ...at('crash', 8, 9));
-    reserve(-13, -58, 13, -36);    // tower plaza
-    reserve(-18, -160, 18, -58);   // evac road and landing zone
- 
-    buildRoads();
-    buildDirtPath();
- 
-    // Landmarks from before, moved into a new layout
-    buildGasStation(...LAYOUT.gas);
-    buildCollapsedHouse(...LAYOUT.house);
+    buildGasStation(30, -20);
+    buildCollapsedHouse(-35, 15);
     buildRadioTower(TOWER_POS.x, TOWER_POS.z);
-    buildEvacRoute();
-    buildCheckpoint(...LAYOUT.checkpoint);
-    buildDiner(...LAYOUT.diner);
-    buildFarm(...LAYOUT.farm);
-    buildCrashedChopper(...LAYOUT.crash);
-    buildChapel(...LAYOUT.chapel);
- 
-    // New city buildings, with furniture inside
-    buildPolice(...LAYOUT.police);
-    buildApartment(...LAYOUT.apartment);
-    buildPharmacy(...LAYOUT.pharmacy);
-    buildHardware(...LAYOUT.hardware);
-    buildHouseB(...LAYOUT.houseB);
-    furnishOldBuildings();
- 
-    buildStreetDetails();
-    buildNature();
-    buildSkeletons();
     buildSecrets();
+    buildEvacRoute();
+    buildCheckpoint(-55, -30);
+    buildDiner(55, 15);
+    buildFarm(-60, 45);
+    buildCrashedChopper(48, -60);
+    buildChapel(-28, -72);
     buildLoreNotes();
+
+    // rocks (visual only)
+    for (let i = 0; i < 80; i++) {
+        const rock = new THREE.Mesh(
+            new THREE.DodecahedronGeometry(Math.random() * 1.2 + 0.3),
+            new THREE.MeshStandardMaterial({ color: 0x6e5a48, flatShading: true })
+        );
+        rock.position.set((Math.random() - 0.5) * 300, 0.2, (Math.random() - 0.5) * 300);
+        rock.castShadow = true;
+        scene.add(rock);
+    }
 }
 
-// A group of guards around one spot
+// A group of guards around one spot. list: [['normal', x, z], ...]
 function spawnCluster(homeX, homeZ, list, guardRadius = 12) {
     for (const [type, x, z] of list) {
         createHusk(x, z, type, { home: { x: homeX, z: homeZ }, guardRadius });
     }
 }
 
-// Same, but everything relative to a landmark from LAYOUT.
-// y: spawn them on an upper floor (UPPER_Y)
-function guards(name, homeDx, homeDz, list, guardRadius = 12, y = 0) {
-    const [x, z] = LAYOUT[name];
-    for (const [type, dx, dz] of list) {
-        createHusk(x + dx, z + dz, type, { home: { x: x + homeDx, z: z + homeDz }, guardRadius, y });
-    }
-}
-
 // To be called at startup and anytime the player presses 'R'
 function spawnEntities() {
-    // Bus crashed across North Street, and every parked car
-    spawnBus(...LAYOUT.bus);
-    spawnCars();
- 
-    // Crates + barrels
-    for (let i = 0; i < 4; i++) spawnCrate(-3 + i * 1.5, 52); // abandoned supply drop on Main Street
-    spawnBarrel(...at('gas', -5, 6));
-    spawnBarrel(...at('gas', -5.6, 7.2));
-    spawnBarrel(...at('police', 6, 8));
-    spawnBarrel(...at('police', 7, 8.6));
-    spawnBarrel(...at('bus', 8, 3));
-    spawnBarrel(...at('diner', -11, -6));
-    spawnBarrel(...at('hardware', -5, 5));
-    spawnBarrel(...at('checkpoint', -8, 6));
-    spawnBarrel(...at('checkpoint', -7.2, 6.6));
-    spawnBarrel(...at('farm', -4, 9));
-    spawnBarrel(-14, 4.5);  // in front of the apartments
-    spawnBarrel(6, 30);     // Main Street
- 
+    // Bus
+    spawnBus(10, 30);
+
+    // Crates + Barrels
+    for (let i = 0; i < 4; i++) spawnCrate (-5 + i * 1.5, -8);
+    spawnBarrel(18, -5);
+    spawnBarrel(19, -6.2);
+    spawnBarrel(-22, 8);
+    spawnBarrel(10, 27);
+    spawnBarrel(25, -12);   // gas station forecourt
+    spawnBarrel(-30, 20);   // outside the house
+
     // Barrels around the tower
     spawnBarrel(-6, -44);
     spawnBarrel(6, -56);
     spawnBarrel(-7, -55);
- 
-    // Bloom nests: farm field, diner, police station, gas station, collapsed house
-    spawnNest(...at('farm', -11, 0));
-    spawnNest(...at('diner', 4, 0));
-    spawnNest(...at('police', -1, -3.5));
-    spawnNest(...at('gas', 1.5, -1.5));
-    spawnNest(...at('house', -1.5, 2));
- 
-    // Husks, location by location
-    guards('farm', -9, 0, [['normal', -8, -4], ['normal', -14, 5], ['runner', -6, 7]]);
-    guards('checkpoint', 0, 8, [['normal', -3, 8], ['normal', 3, 7], ['runner', 0, 12]]);
-    guards('bus', 4, -2, [['brute', 4, -6], ['normal', 10, 0], ['normal', -6, -3], ['runner', 2, 5]]);
-    guards('house', 0, 6, [['normal', 0, 7], ['normal', 4, 5]]);
-    // apartment: one in the lobby, one upstairs, two out front (door faces south, z goes down)
-    guards('apartment', 2, 0, [['normal', 2, 0]], 8);
-    guards('apartment', 3, 3, [['normal', 3, 3]], 8, UPPER_Y);
-    guards('apartment', 0, -9, [['normal', -2, -9], ['runner', 4, -9.5]]);
-    guards('diner', -9, 0, [['normal', -10, -3], ['normal', -8, 3], ['runner', -13, 0]]);
-    guards('pharmacy', 0, -8, [['normal', -2, -7], ['runner', 3, -7]]);
-    // police: two out front, one at the front desk, two in the armory upstairs
-    guards('police', 0, 9, [['normal', -2, 8], ['normal', 3, 9]]);
-    guards('police', 3, -2, [['normal', 3, -2]], 8);
-    guards('police', 2, -3, [['normal', 0, -3], ['runner', 5, 2]], 8, UPPER_Y);
-    guards('gas', 0, 7, [['normal', -3, 6], ['normal', 3, 6], ['normal', 0, 10], ['runner', -5, 3]]);
-    guards('hardware', 0, 5, [['normal', -1, 6], ['runner', 2, 7]]);
-    guards('chapel', 0, 6, [['normal', 2, 8], ['normal', -2, 8], ['normal', 10, 5]]);
-    guards('crash', 0, 0, [['normal', 4, 4], ['runner', -4, -3]]);
-    spawnCluster(0, -50, [['normal', 4, -46], ['normal', -4, -47], ['runner', 0, -57]], 10); // tower
- 
+
+    // Gas station: nest inside the shop, guards on the forecourt
+    spawnNest(31.5, -21.5);
+    spawnCluster(30, -13, [['normal', 27, -14], ['normal', 33, -14], ['normal', 30, -10], ['runner', 25, -17], ['runner', 35, -16]]);
+
+    // Collapsed house: nest in the back room, guards around the door
+    spawnNest(-36.5, 17);
+    spawnCluster(-35, 20, [['normal', -35, 21], ['normal', -31, 19], ['normal', -38, 22], ['runner', -30, 14]]);
+
+    // Bus: nest behind it, a brute watching the transmitter
+    spawnNest(8, 34.5);
+    spawnCluster(15, 28, [['brute', 14, 23], ['normal', 20, 30], ['normal', 6, 26], ['runner', 12, 35]]);
+
+    // Tower guards
+    spawnCluster(0, -50, [['normal', 4, -46], ['normal', -4, -47], ['runner', 0, -57]], 10);
+
     // A few wanderers out in the open
-    createHusk(-35, -20);
-    createHusk(30, 45, 'runner');
-    createHusk(50, 20);
-    createHusk(-50, -30, 'brute', { home: { x: -50, z: -30 }, guardRadius: 10 });
- 
+    createHusk(-25, -22);
+    createHusk(35, 25, 'runner');
+    createHusk(-30, -30, 'brute', { home: { x: -30, z: -30 }, guardRadius: 10 });
+
     // One radio part at each location
-    spawnPickup('battery', ...at('gas', 0, 7));          // under the gas station canopy
-    spawnPickup('coil', ...at('house', 0, -2));          // inside the collapsed house
-    spawnPickup('transmitter', ...at('bus', 7.5, -2.7)); // beside the bus
- 
-    // Weapons, as rewards for exploring
-    spawnPickup('shotgun', ...at('police', 2.5, 1), { y: UPPER_Y }); // police armory, upstairs
-    spawnPickup('machete', ...at('hardware', 1.8, -3.25), { y: 1.06 }); // on the hardware store workbench
- 
+    spawnPickup('battery', 30, -13); // in front of the gas station
+    spawnPickup('coil', -35, 13); // inside the house
+    spawnPickup('transmitter', 17.5, 27.3); // beside the bus
+
     // Supplies (these respawn after being picked up)
-    spawnPickup('ammo', ...at('farm', 6, 1.5), { y: 0.2 });   // farmhouse porch, near the start
-    spawnPickup('medkit', ...at('farm', 1.5, 1.2));           // farmhouse kitchen
-    spawnPickup('ammo', ...at('checkpoint', 6, -0.5));
-    spawnPickup('ammo', ...at('checkpoint', -6, -7));
-    spawnPickup('shells', ...at('checkpoint', 7, 1));
-    spawnPickup('ammo', 2, 50);                               // by the supply crates
-    spawnPickup('ammo', ...at('houseB', 1.6, -1.2), { y: 0.82 }); // on the kitchen table
-    spawnPickup('ammo', ...at('apartment', 3, 2));            // lobby (door faces south)
-    spawnPickup('medkit', ...at('apartment', -2, 5), { y: UPPER_Y });
-    spawnPickup('ammo', ...at('apartment', 1, 4.5), { y: UPPER_Y });
-    spawnPickup('medkit', ...at('diner', -1, 1));
-    spawnPickup('medkit', ...at('pharmacy', 1, 1.5));         // door faces south, so +z is the back
-    spawnPickup('medkit', ...at('pharmacy', -4.8, -2.5));
-    spawnPickup('ammo', ...at('police', 3, -0.5));
-    spawnPickup('shells', ...at('police', 3.5, 1.6), { y: UPPER_Y });
-    spawnPickup('shells', ...at('hardware', 0.5, -1));
-    spawnPickup('ammo', ...at('gas', -1, 1.5));
-    spawnPickup('ammo', ...at('chapel', 0, 1));
-    spawnPickup('medkit', ...at('crash', 3, -3));
+    spawnPickup('medkit', -10, 0);
+    spawnPickup('medkit', 20, 15);
+    spawnPickup('ammo', -20, -25);
+    spawnPickup('ammo', 5, -3);
+    spawnPickup('ammo', 0, 4);
+    spawnPickup('ammo', 22, -28);
+    spawnPickup('ammo', -24, 22);
     spawnPickup('ammo', 4, -44); // stocked up at the tower
     spawnPickup('medkit', -4, -44);
- 
+
     // Evac route: crates, barrels at the barricade, supply cache, LZ supplies
     spawnCrate(-3, -84);
     spawnCrate(-4.5, -84.6);
@@ -3385,16 +2187,17 @@ function spawnEntities() {
     spawnBarrel(2.5, -96.5);
     spawnPickup('ammo', -5.5, -89);
     spawnPickup('medkit', -5.5, -91);
-    spawnPickup('shells', -5.5, -87.5);
     spawnBarrel(-10, -130);
     spawnBarrel(10, -146);
     spawnBarrel(9, -128);
     spawnPickup('ammo', -12, -150);
     spawnPickup('ammo', 12, -150);
     spawnPickup('medkit', 0, -125);
- 
+    spawnOutskirts();
+
     setupTriggers();
 }
+
 
 //------------------------------------------------
 // Shooting & Barrel Explostions
@@ -3518,245 +2321,75 @@ function hitMarker() {
 }
 
 
-//------------------------------------------------
-// Weapons
-// 1 = pistol, 2 = shotgun, 3 = machete (or scroll the mouse wheel).
-// You start with the pistol; the shotgun and machete have to be found in the city.
-//
-// Each weapon model is sized automatically by its longest side (length).
-// If one shows up pointing backwards, set flip: true. Use viewPos / viewRot
-// to nudge how it sits in your hand: [x, y, z] in meters / radians.
-const WEAPONS = {
-    pistol: {
-        name: 'Pistol', slot: 1, model: 'pistol', length: 0.32,
-        ammo: 'ammo', pellets: 1, spread: 0.003, damage: 1, cooldown: 0.2, range: 100,
-        recoil: 0.07, kick: 0.1, alert: 30,
-        viewPos: [0, 0, 0], viewRot: [0, 0, 0], flip: false,
-    },
-    shotgun: {
-        name: 'Shotgun', slot: 2, model: 'shotgun', length: 0.8,
-        ammo: 'shells', pellets: 7, spread: 0.06, damage: 1, cooldown: 0.85, range: 35,
-        recoil: 0.18, kick: 0.3, alert: 45,
-        viewPos: [0, 0.02, -0.12], viewRot: [0, 0, 0], flip: false,
-    },
-    machete: {
-        name: 'Machete', slot: 3, model: 'machete', length: 0.65,
-        melee: true, damage: 2, cooldown: 0.45, reach: 2.6,
-        viewPos: [0.05, 0.08, -0.05], viewRot: [0.35, 0, -0.5], flip: false,
-    },
-};
-const WEAPON_ORDER = ['pistol', 'shotgun', 'machete'];
- 
-let weapon = 'pistol';
-const owned = { pistol: true, shotgun: false, machete: false };
-let shells = 0;
-let weaponCooldown = 0;
-const viewModels = {}; // weapon -> the model held on screen
- 
-// Box-built stand-ins, used when a weapon's model file is missing
-function fallbackViewModel(key) {
-    const g = new THREE.Group();
-    const DARK = 0x2a2a2a;
-    if (key === 'pistol') {
-        g.add(gunBody, gunBarrel, gunGrip); // the original box gun
-        g.userData.muzzle = 0.45;
-    } else if (key === 'shotgun') {
-        part(g, 0.09, 0.1, 0.55, 0, 0, -0.1, DARK);
-        part(g, 0.05, 0.05, 0.5, 0, 0.04, -0.55, 0x1a1a1a);
-        part(g, 0.07, 0.12, 0.3, 0, -0.04, 0.3, 0x4a3a2a, 0.2, 0, 0);
-        g.userData.muzzle = 0.82;
-    } else {
-        part(g, 0.05, 0.14, 0.12, 0, -0.05, 0.12, 0x3a2a1a);        // handle
-        part(g, 0.015, 0.1, 0.55, 0, 0, -0.22, 0x9a9a92);           // blade
-    }
-    return g;
-}
- 
-// Build the on-screen model for each weapon (after the models have loaded)
-function initWeapons() {
-    gun.remove(gunBody, gunBarrel, gunGrip); // the box gun is only used if the pistol model is missing
-    for (const key of WEAPON_ORDER) {
-        const w = WEAPONS[key];
-        let vm;
-        if (models[w.model]) {
-            vm = sizedModel(w.model, w.length, w.flip);
-            vm.position.set(...w.viewPos);
-            vm.rotation.set(...w.viewRot);
-            vm.userData.muzzle = w.length / 2 + 0.05 - w.viewPos[2];
-            vm.traverse((c) => { if (c.isMesh) c.castShadow = false; });
-        } else {
-            vm = fallbackViewModel(key);
+function shoot() {
+        if (ammo <= 0) {
+            showMessage('Out of ammo! Press F to shove.', 1.5);
+            return;
         }
-        vm.visible = false;
-        gun.add(vm);
-        viewModels[key] = vm;
-    }
-    equip('pistol');
-}
- 
-function equip(key) {
-    if (!owned[key] || !viewModels[key]) return;
-    weapon = key;
-    for (const [k, vm] of Object.entries(viewModels)) vm.visible = k === key;
-    muzzleLight.position.set(0, 0.02, -(viewModels[key].userData.muzzle || 0.45));
-    gun.position.y = GUN_REST.y - 0.3; // dip out of view, then it slides back up
-    weaponCooldown = Math.max(weaponCooldown, 0.25);
-}
- 
-function giveWeapon(key) {
-    owned[key] = true;
-    equip(key);
-}
- 
-function cycleWeapon(dir) {
-    const list = WEAPON_ORDER.filter((k) => owned[k]);
-    const i = list.indexOf(weapon);
-    equip(list[(i + dir + list.length) % list.length]);
-}
- 
-document.addEventListener('mousedown', (e) => {
-    if (e.button !== 0 || !controls.isLocked || gameOver) return;
-    attack();
-});
-document.addEventListener('wheel', (e) => {
-    if (!controls.isLocked || gameOver || e.deltaY === 0) return;
-    cycleWeapon(Math.sign(e.deltaY));
-});
- 
-// Everything a bullet can hit
-function shootTargets() {
-    return [
+        ammo--;
+
+        // Muzzle flash & recoil
+        muzzleLight.intensity = 6;
+        setTimeout(() => (muzzleLight.intensity = 0), 50);
+        gun.position.z += 0.08;
+
+    // gunshots are loud: nearby husks come running
+    alertHusks(playerBody.position.x, playerBody.position.z, 30);
+
+    raycaster.setFromCamera(screenCenter, camera);
+    raycaster.far = 100;
+    const targets = [
         ...husks.filter((h) => !h.dead).map((h) => h.mesh),
         ...nests.filter((n) => !n.dead).map((n) => n.group),
         ...(barricade ? [barricade.group] : []),
         ...props.map((p) => p.mesh),
         ...obstacles,
     ];
-}
- 
-function attack() {
-    if (weaponCooldown > 0) return;
-    const w = WEAPONS[weapon];
-    if (w.melee) {
-        swingMelee(w);
-        return;
-    }
- 
-    const left = w.ammo === 'shells' ? shells : ammo;
-    if (left <= 0) {
-        const what = w.ammo === 'shells' ? 'shells' : 'ammo';
-        showMessage(owned.machete ? `Out of ${what}! Press 3 for the machete.` : `Out of ${what}! Press F to shove.`, 1.5);
-        return;
-    }
-    if (w.ammo === 'shells') shells--;
-    else ammo--;
-    weaponCooldown = w.cooldown;
- 
-    // Muzzle flash & recoil
-    muzzleLight.intensity = w.pellets > 1 ? 10 : 6;
-    setTimeout(() => (muzzleLight.intensity = 0), 50);
-    gun.position.z += w.recoil;
-    gun.rotation.x += w.kick;
- 
-    // gunshots are loud: nearby husks come running
-    alertHusks(playerBody.position.x, playerBody.position.z, w.alert);
- 
-    const origin = new THREE.Vector3();
-    const forward = new THREE.Vector3();
-    camera.getWorldPosition(origin);
-    camera.getWorldDirection(forward);
-    const targets = shootTargets();
-    let hitSomething = false;
- 
-    for (let i = 0; i < w.pellets; i++) {
-        const dir = forward.clone();
-        if (w.spread) {
-            dir.x += (Math.random() - 0.5) * 2 * w.spread;
-            dir.y += (Math.random() - 0.5) * 2 * w.spread;
-            dir.z += (Math.random() - 0.5) * 2 * w.spread;
-            dir.normalize();
-        }
-        raycaster.set(origin, dir);
-        raycaster.far = w.range;
-        const hits = raycaster.intersectObjects(targets, true);
-        const end = hits.length > 0 ? hits[0].point : origin.clone().addScaledVector(dir, w.range);
-        spawnTracer(end);
-        if (i < 3) sendShot(origin, end); // a few tracers is plenty for other players to see
-        if (hits.length > 0 && applyHit(hits[0], dir, w.damage)) hitSomething = true;
-    }
-    if (hitSomething) hitMarker();
-}
- 
-// What happens where a bullet lands. Returns true if it hit a husk or nest.
-function applyHit(hit, dir, damage) {
+
+    const hits = raycaster.intersectObjects(targets, true);
+    const endPoint = hits.length > 0
+        ? hits[0].point
+        : raycaster.ray.origin.clone().add(raycaster.ray.direction.clone().multiplyScalar(100));
+        spawnTracer(endPoint);
+        sendShot(raycaster.ray.origin, endPoint);
+
+        if (hits.length === 0) return;
+
+    const hit = hits[0];
     let obj = hit.object;
     while (obj && !obj.userData.husk && !obj.userData.prop && !obj.userData.nest && !obj.userData.barricade) {
         obj = obj.parent;
     }
- 
+
     // green bloom splatter when hitting husks or nests, dust everywhere else
     const bloom = obj && (obj.userData.husk || obj.userData.nest);
     spawnImpact(hit.point, bloom ? 0x66ff44 : 0xc8a878);
-    if (!obj) return false;
- 
+
+    if (!obj) return;
+
+    const dir = raycaster.ray.direction;
+
     if (obj.userData.husk) {
-        damageHusk(obj.userData.husk, damage, dir);
-        return true;
-    }
-    if (obj.userData.nest) {
-        damageNest(obj.userData.nest, damage);
-        return true;
-    }
-    if (obj.userData.barricade) {
-        damageBarricade(damage);
-        return false;
-    }
- 
-    const p = obj.userData.prop;
-    if (!props.includes(p)) return false; // already blown up by an earlier pellet
-    if (p.explosive) {
-        explode(p);
+        damageHusk(obj.userData.husk, 1, dir);
+        hitMarker();
+    } else if (obj.userData.nest) {
+        damageNest(obj.userData.nest, 1);
+        hitMarker();
+    } else if (obj.userData.barricade) {
+        damageBarricade(1);
     } else {
-        const offset = new CANNON.Vec3(
-            hit.point.x - p.body.position.x,
-            hit.point.y - p.body.position.y,
-            hit.point.z - p.body.position.z
-        );
-        p.body.applyImpulse(new CANNON.Vec3(dir.x * 30 * damage, 5, dir.z * 30 * damage), offset);
-    }
-    return false;
-}
- 
-// Machete: quiet (doesn't alert husks), hits everything in an arc in front of you
-function swingMelee(w) {
-    weaponCooldown = w.cooldown;
-    gun.rotation.set(-0.7, 0.6, 1.0); // wind-up pose; it swings back as it eases to rest
- 
-    const forward = new THREE.Vector3();
-    camera.getWorldDirection(forward);
-    forward.y = 0;
-    forward.normalize();
-    const px = playerBody.position.x;
-    const pz = playerBody.position.z;
-    let hitSomething = false;
- 
-    for (const h of husks) {
-        if (h.dead || Math.abs(h.body.position.y - playerBody.position.y) > 1.5) continue;
-        const dx = h.body.position.x - px;
-        const dz = h.body.position.z - pz;
-        const d = Math.hypot(dx, dz) || 0.01;
-        if (d > w.reach + h.radius || (dx * forward.x + dz * forward.z) / d < 0.5) continue;
-        damageHusk(h, w.damage, new THREE.Vector3(dx / d, 0, dz / d), 0.6);
-        hitSomething = true;
-    }
-    for (const n of nests) {
-        if (!n.dead && Math.hypot(n.x - px, n.z - pz) < w.reach + 1) {
-            damageNest(n, w.damage);
-            hitSomething = true;
+        const p = obj.userData.prop;
+        if (p.explosive) {
+            explode(p);
+        } else {
+            const offset = new CANNON.Vec3(
+                hit.point.x - p.body.position.x,
+                hit.point.y - p.body.position.y,
+                hit.point.z - p.body.position.z
+            );
+            p.body.applyImpulse(new CANNON.Vec3(dir.x * 30, 5, dir.z * 30),offset)
         }
     }
-    if (barricade && Math.abs(pz - barricade.z) < 2.2 && Math.abs(px) < 8) damageBarricade(w.damage);
-    if (hitSomething) hitMarker();
 }
 
 function explode(p) {
@@ -3808,7 +2441,7 @@ function explode(p) {
             if (other.dormant) {
                 other.dormant = false;
                 other.body.type = CANNON.Body.DYNAMIC;
-                other.body.mass = other.wakeMass || 800;
+                other.body.mass = 800;
                 other.body.updateMassProperties();
                 other.body.wakeUp();
                 charModel(other.mesh);
@@ -3860,10 +2493,6 @@ function updateEffects(dt) {
     }
     updateFx(dt);
     gun.position.lerp(GUN_REST, Math.min(1, dt * 15));
-    const ease = Math.min(1, dt * 12);
-    gun.rotation.x += (0 - gun.rotation.x) * ease;
-    gun.rotation.y += (0 - gun.rotation.y) * ease;
-    gun.rotation.z += (0 - gun.rotation.z) * ease;
 }
 
 
@@ -3990,20 +2619,15 @@ function resetGame() {
     secretsFound = 0;
     for (const zone of hazards) zone.warned = false;
 
-    playerBody.position.set(SPAWN.x, 2, SPAWN.z);
+    playerBody.position.set(0, 2, 10);
     playerBody.velocity.set(0, 0, 0);
-    camera.position.set(SPAWN.x, 2 + EYE_HEIGHT, SPAWN.z);
-    camera.rotation.set(0, SPAWN.yaw, 0);
+    camera.position.set(0, 2 + EYE_HEIGHT, 10);
+    camera.rotation.set(0, 0, 0);
     knockback.set(0, 0, 0);
     hurtEl.style.opacity = 0;
 
     health = 100;
     ammo = 30;
-    shells = 0;
-    owned.shotgun = false;
-    owned.machete = false;
-    equip('pistol');
-    closeNote();
     partsFound = 0;
     score = 0;
     meleeCooldown = 0;
@@ -4036,13 +2660,12 @@ function animate() {
 
     if (!gameOver && controls.isLocked) {
         meleeCooldown -= dt;
-        weaponCooldown -= dt;
         updatePlayer(dt);
         updateHazards(dt, time);
         updateHusks(dt, time);
         updateNests(dt, time);
         updatePickups(dt, time);
-        updateInteraction();
+        updateSecrets();
         updateTriggers();
         updateTower(dt, time);
         updateEffects(dt);
@@ -4066,7 +2689,6 @@ function animate() {
     sun.position.set(playerBody.position.x + 30, 50, playerBody.position.z + 20);
     sun.target.position.set(playerBody.position.x, 0, playerBody.position.z);
 
-    updateCity(time);
     updateHUD();
     if (health <= 0 && !gameOver) {
         gameOver = true;
@@ -4090,11 +2712,8 @@ window.addEventListener('resize', () => {
 
 try {
     await loadModels();
-    initWeapons();
     buildStaticWorld();
     spawnEntities();
-    camera.position.set(SPAWN.x, 2 + EYE_HEIGHT, SPAWN.z);
-    camera.rotation.set(0, SPAWN.yaw, 0);
     initNetwork(scene, {
         models: { female: models.female, male: models.male },
         profile: myProfile(),

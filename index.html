@@ -28,21 +28,12 @@
         #hurt { position: absolute; inset: 0; pointer-events: none; opacity: 0;
                 background: radial-gradient(circle, transparent 40%, rgba(200, 0, 0, 0.85));
                 transition: opacity 0.25s; }
-        #weapons { font-size: 14px; opacity: 0.8; margin-bottom: 4px; }
-        #prompt { position: absolute; top: 58%; width: 100%; text-align: center; color: #fff;
-                font-size: 18px; text-shadow: 1px 1px 3px #000; pointer-events: none; display: none; }
-        #note { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
-                width: min(520px, 80vw); padding: 24px 28px; border-radius: 4px;
-                background: #e8dfc6; color: #2b241b; font: 18px/1.5 Georgia, serif;
-                box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6); display: none; pointer-events: none; }
-        #note-footer { margin-top: 16px; font: 13px monospace; color: #6b5d48; text-align: right; }
     </style>
 </head>
 <body> 
     <div id="hud">
         <div id="health">Health: 100</div>
-        <div id="ammo">Pistol: 30</div>
-        <div id="weapons"></div>
+        <div id="ammo">Ammo: 30</div>
         <div id="parts">Radio parts: 0 / 3</div>
         <div id="score">Score: 0</div>
         <div id="objective"></div>
@@ -51,11 +42,6 @@
     </div>
     <div id="hurt"></div>
     <div id="message"></div>
-    <div id="prompt"></div>
-    <div id="note">
-        <div id="note-text"></div>
-        <div id="note-footer"><span id="note-count"></span> · Press E to close</div>
-    </div>
     <div id="crosshair"></div>
     <div id="overlay">
         <h1 id="overlay-title">LAST SIGNAL</h1>
@@ -67,8 +53,7 @@
                 <button id="pick-male" data-model="male">Male</button>
             </div>
         </div>
-        <p>Move: WASD, Sprint: Shift, Jump: Space, Look Around: Mouse, Attack: Click, Shove: F<br>
-        Interact / Pick up / Read: E, Weapons: 1 2 3 or Mouse Wheel</p>
+        <p>Move: WASD, Sprint: Shift, Jump: Space, Look Around: Mouse, Shoot: Click, Shove: F</p>
     </div>
 
 <!-- Importing the map -->
